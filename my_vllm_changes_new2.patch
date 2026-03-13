@@ -1,0 +1,1048 @@
+diff --git a/csrc/attention/dtype_fp8.cuh b/csrc/attention/dtype_fp8.cuh
+index e714e321b..3309f2fa0 100644
+--- a/csrc/attention/dtype_fp8.cuh
++++ b/csrc/attention/dtype_fp8.cuh
+@@ -15,6 +15,7 @@ enum class Fp8KVCacheDataType {
+   kAuto = 0,
+   kFp8E4M3 = 1,
+   kFp8E5M2 = 2,
++  kFp4E2M1 = 3,  // FP4 E2M1 (MXFP4) format, supported on gfx950+
+ };
+ 
+ // fp8 vector types for quantization of kv cache
+diff --git a/csrc/cache_kernels.cu b/csrc/cache_kernels.cu
+index a02fcb617..8ffbe812a 100644
+--- a/csrc/cache_kernels.cu
++++ b/csrc/cache_kernels.cu
+@@ -129,6 +129,8 @@ struct CopyWithScaleOp {
+   __device__ __forceinline__ void operator()(OutT& dst, const InT src) const {
+     if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+       dst = static_cast<OutT>(src);
++    } else if constexpr (kv_dt == Fp8KVCacheDataType::kFp4E2M1) { // deal with FP4
++        dst = fp4::scaled_vec_conversion<Tout, Tin>(src, scale);
+     } else {
+       dst = fp8::scaled_convert<OutT, InT, kv_dt>(src, scale);
+     }
+@@ -806,6 +808,20 @@ void convert_fp8(torch::Tensor& dst_cache, torch::Tensor& src_cache,
+       CALL_CONVERT_FP8(__nv_bfloat16, uint8_t,
+                        vllm::Fp8KVCacheDataType::kFp8E4M3);
+     }
++  } else if (kv_cache_dtype == "fp4" || kv_cache_dtype == "fp4_e2m1") {
++    if (src_cache.dtype() == at::ScalarType::Float) {
++      FN(float, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
++    } else if (src_cache.dtype() == at::ScalarType::Half) {
++      FN(ck_tile::fp16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1); 
++    } else if (src_cache.dtype() == at::ScalarType::BFloat16) {
++      FN(ck_tile::bf16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
++    } else if (dst_cache.dtype() == at::ScalarType::Float) {
++      FN(uint8_t, float, vllm::Fp8KVCacheDataType::kFp4E2M1);
++    } else if (dst_cache.dtype() == at::ScalarType::Half) {
++      FN(uint8_t, ck_tile::fp16_t, vllm::Fp8KVCacheDataType::kFp4E2M1); 
++    } else if (dst_cache.dtype() == at::ScalarType::BFloat16) {
++      FN(uint8_t, ck_tile::bf16_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
++    }
+   } else {
+     TORCH_CHECK(false, "Unsupported data type: ", kv_cache_dtype);
+   }
+diff --git a/csrc/quantization/w8a8/fp8/amd/quant_utils.cuh b/csrc/quantization/w8a8/fp8/amd/quant_utils.cuh
+index 81f5cb83f..cfe20e839 100644
+--- a/csrc/quantization/w8a8/fp8/amd/quant_utils.cuh
++++ b/csrc/quantization/w8a8/fp8/amd/quant_utils.cuh
+@@ -660,8 +660,19 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale) {
+         } else {                                                               \
+           TORCH_CHECK(false,                                                   \
+                       "Unsupported input type of kv cache: ", SRC_DTYPE);      \
++        }									\
++      } else if (KV_DTYPE == "fp4" || KV_DTYPE == "fp4_e2m1" ) {               \
++        if (SRC_DTYPE == at::ScalarType::Float) {                              \
++          FN(float, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);              \
++        } else if (SRC_DTYPE == at::ScalarType::Half) {                        \
++          FN(uint16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);           \
++        } else if (SRC_DTYPE == at::ScalarType::BFloat16) {                    \
++          FN(__nv_bfloat16, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);      \
++        } else {                                                               \
++          TORCH_CHECK(false,                                                   \
++                      "Unsupported input type of kv cache: ", SRC_DTYPE);      \
+         }                                                                      \
+-      } else {                                                                 \
++      } else {                                                         	      \
+         TORCH_CHECK(false, "Unsupported data type of kv cache: ", KV_DTYPE);   \
+       }                                                                        \
+     }
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index 318efc82a..71c8a620b 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -29,6 +29,7 @@ CacheDType = Literal[
+     "fp8_e5m2",
+     "fp8_inc",
+     "fp8_ds_mla",
++    "fp4",
+ ]
+ MambaDType = Literal["auto", "float32", "float16"]
+ PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
+diff --git a/vllm/config/profiler.py b/vllm/config/profiler.py
+index 76cc546f3..c0a75caf6 100644
+--- a/vllm/config/profiler.py
++++ b/vllm/config/profiler.py
+@@ -15,7 +15,7 @@ from vllm.utils.hashing import safe_hash
+ 
+ logger = init_logger(__name__)
+ 
+-ProfilerKind = Literal["torch", "cuda"]
++ProfilerKind = Literal["torch", "cuda", "rpd"]
+ 
+ 
+ @config
+diff --git a/vllm/envs.py b/vllm/envs.py
+index d77c1e9d9..dcd3c9b43 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -93,6 +93,10 @@ if TYPE_CHECKING:
+     # See also vllm/config/profiler.py and `--profiler-config` argument
+     VLLM_TORCH_CUDA_PROFILE: str | None = None
+     VLLM_TORCH_PROFILER_DIR: str | None = None
++    ENABLE_TRACING_RPD: bool = False
++    VLLM_SUBSEQUENT_DECODE_STEPS: int = 0
++    VLLM_MIN_REQUEST_DECODE_STEP: int = 0
++    VLLM_LOG_PREEMPTIONS: bool = False
+     VLLM_TORCH_PROFILER_RECORD_SHAPES: str | None = None
+     VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY: str | None = None
+     VLLM_TORCH_PROFILER_DISABLE_ASYNC_LLM: str | None = None
+@@ -462,6 +466,18 @@ def get_vllm_port() -> int | None:
+ logger = logging.getLogger(__name__)
+ 
+ environment_variables: dict[str, Callable[[], Any]] = {
++    "ENABLE_TRACING_RPD": lambda: bool(
++        int(os.getenv("ENABLE_TRACING_RPD", "0"))
++    ),
++    "VLLM_SUBSEQUENT_DECODE_STEPS": lambda: int(
++        os.getenv("VLLM_SUBSEQUENT_DECODE_STEPS", "0")
++    ),
++    "VLLM_MIN_REQUEST_DECODE_STEP": lambda: int(
++        os.getenv("VLLM_MIN_REQUEST_DECODE_STEP", "0")
++    ),
++    "VLLM_LOG_PREEMPTIONS": lambda: bool(
++        int(os.getenv("VLLM_LOG_PREEMPTIONS", "0"))
++    ),
+     # ================== Installation Time Env Vars ==================
+     # Target device of vLLM, supporting [cuda (by default),
+     # rocm, cpu]
+diff --git a/vllm/model_executor/layers/quantization/quark/schemes/quark_ocp_mx.py b/vllm/model_executor/layers/quantization/quark/schemes/quark_ocp_mx.py
+index eeb60023d..ebc007214 100644
+--- a/vllm/model_executor/layers/quantization/quark/schemes/quark_ocp_mx.py
++++ b/vllm/model_executor/layers/quantization/quark/schemes/quark_ocp_mx.py
+@@ -118,7 +118,7 @@ try:
+                 )
+ 
+                 gemm_a4w4(
+-                    x_q, weight, x_s, weight_scale.view(x_s.dtype), y, bpreshuffle=True
++                    x_q, weight.view(x_q.dtype), x_s, weight_scale.view(x_s.dtype), y, bpreshuffle=True
+                 )
+             return y[:M]
+         else:
+diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
+index f0c7e9366..58cdd2f66 100644
+--- a/vllm/utils/torch_utils.py
++++ b/vllm/utils/torch_utils.py
+@@ -42,6 +42,8 @@ STR_DTYPE_TO_TORCH_DTYPE = {
+     "int8": torch.int8,
+     "fp8_inc": torch.float8_e4m3fn,
+     "fp8_ds_mla": torch.uint8,
++    "fp4": torch.uint8,
++    "fp4_e2m1": torch.uint8,
+ }
+ 
+ TORCH_DTYPE_TO_NUMPY_DTYPE = {
+diff --git a/vllm/v1/attention/backends/rocm_aiter_fa.py b/vllm/v1/attention/backends/rocm_aiter_fa.py
+index f384aaa46..6f9bcd841 100644
+--- a/vllm/v1/attention/backends/rocm_aiter_fa.py
++++ b/vllm/v1/attention/backends/rocm_aiter_fa.py
+@@ -30,6 +30,28 @@ from vllm.v1.kv_cache_interface import AttentionSpec
+ 
+ _PARTITION_SIZE_ROCM = 256
+ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
++USING_SHUFFLE_LAYOUT = False #True
++
++from functools import cache, lru_cache
++
++@lru_cache(maxsize=1)
++def get_static_kvscale(
++        k_scale_float: float,
++        v_scale_float: float,
++        num_kv_heads: int,
++        num_blocks: int,
++        block_size: int,
++        device,
++    ):
++    k_scale = torch.empty((num_kv_heads, num_blocks * block_size),
++                        dtype=torch.float32,
++                        device=device)
++    v_scale = torch.empty((num_kv_heads, num_blocks * block_size),
++                        dtype=torch.float32,
++                        device=device)
++    k_scale.fill_(k_scale_float)
++    v_scale.fill_(v_scale_float)
++    return k_scale, v_scale
+ 
+ if current_platform.is_rocm():
+     import aiter
+@@ -107,6 +129,42 @@ if current_platform.is_rocm():
+                     v_reg = (v_reg.to(tl.float32) * v_scale).to(v_dtype)
+                 tl.store(key_ptr_offset + col_offsets + i, k_reg, mask=mask)
+                 tl.store(value_ptr_offset + col_offsets + i, v_reg, mask=mask)
++        elif CACHE_FORMAT == "SHUFFLE":
++            # for kv cache layout as
++            # K: [num_blocks, num_head, head_dim // x, page_size, x]
++            # V: [num_blocks, num_head, page_size // x, head_dim, x]
++            key_cache_ptr_offset = (
++                key_cache_ptr
++                + block_id * num_heads * head_size * PAGE_SIZE
++                + slot_id * x
++            )
++            value_cache_ptr_offset = (
++                value_cache_ptr
++                + block_id * num_heads * head_size * PAGE_SIZE
++                + (slot_id // x) * head_size * x
++                + slot_id % x
++            )
++
++            for i in tl.range(0, head_size * num_heads, BLOCK_SIZE):
++                offset = col_offsets + i
++                mask = offset < head_size * num_heads
++                k_reg_offset = (
++                    (offset // head_size) * head_size * PAGE_SIZE
++                    + (offset % head_size) // x * PAGE_SIZE * x
++                    + (offset % head_size) % x
++                )
++                v_reg_offset = (offset // head_size) * head_size * PAGE_SIZE + (
++                    offset % head_size
++                ) * x
++                k_reg = tl.load(key_cache_ptr_offset + k_reg_offset)
++                v_reg = tl.load(value_cache_ptr_offset + v_reg_offset)
++                if DEQUANT:
++                    k_dtype = k_reg.dtype
++                    v_dtype = v_reg.dtype
++                    k_reg = (k_reg.to(tl.float32) * k_scale).to(k_dtype)
++                    v_reg = (v_reg.to(tl.float32) * v_scale).to(v_dtype)
++                tl.store(key_ptr_offset + col_offsets + i, k_reg, mask=mask)
++                tl.store(value_ptr_offset + col_offsets + i, v_reg, mask=mask)
+ 
+     def cp_mha_gather_cache(
+         key_cache: torch.Tensor,
+@@ -123,17 +181,14 @@ if current_platform.is_rocm():
+         kv_cache_layout: str,
+         total_tokens: int,
+     ):
+-        assert kv_cache_layout in ["v0", "NHD", "HND"], (
+-            "kv_cache_layout only support v0, NHD, HND"
++        assert kv_cache_layout in ["NHD", "SHUFFLE"], (
++            "kv_cache_layout only support v0, NHD, HND, SHUFFLE"
+         )
+         head_dim = key.shape[2]
+-        x = 0
++        x = 16 // key_cache.element_size()
+         # assert dequant is True, "Currently, we only support "\
+         # "gather cache with dequant"
+         # For k cache layout: [num_blocks, num_heads, page_size, head_dim]
+-        assert kv_cache_layout == "NHD", (
+-            "ROCM_AITER_FA_BACKEND Only support NHD kv cache layout for now"
+-        )
+         assert head_dim == key_cache.shape[3], (
+             "We assume your kv cache layout is [num_blocks, "
+             "page_size, num_heads, head_dim], but got otherwise"
+@@ -163,6 +218,119 @@ if current_platform.is_rocm():
+             BLOCK_SIZE=head_dim,
+         )
+ 
++    @triton.jit
++    def reshape_and_cache_shuffle_kernel(
++        key_ptr,  # [num_tokens, num_kv_heads, head_size]
++        value_ptr,  # [num_tokens, num_kv_heads, head_size]
++        key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, block_size, x]
++        value_cache_ptr,  # [num_blocks, num_kv_heads, block_size // x, head_size, x]
++        slot_mapping_ptr,  # [num_tokens]
++        k_scale_ptr,
++        v_scale_ptr,
++        x,
++        k_stride0,
++        v_stride0,
++        block_size,
++        head_size,
++        num_kv_heads,
++        BLOCK_SIZE: tl.constexpr,
++        QUANT: tl.constexpr,
++    ):
++        tid = tl.program_id(0)
++        head_id = tl.program_id(1)
++        offset = tl.arange(0, BLOCK_SIZE)
++        src_offset_k = tid * k_stride0 + head_id * head_size
++        src_offset_v = tid * v_stride0 + head_id * head_size
++        slot_id = tl.load(slot_mapping_ptr + tid)
++        if slot_id < 0:
++            return
++        block_id = slot_id // block_size
++        block_offset = slot_id % block_size
++        dst_offset = (
++            block_id * num_kv_heads * head_size * block_size
++            + head_id * head_size * block_size
++        )
++        dst_k_shuffle_offset = (
++            dst_offset + offset // x * block_size * x + block_offset * x + offset % x
++        )
++        dst_v_shuffle_offset = (
++            dst_offset
++            + block_offset // x * head_size * x
++            + offset * x
++            + block_offset % x
++        )
++        k_val = tl.load(key_ptr + src_offset_k + offset)
++        v_val = tl.load(value_ptr + src_offset_v + offset)
++        if QUANT:
++            k_scale = tl.load(k_scale_ptr)
++            v_scale = tl.load(v_scale_ptr)
++            k_dtype = key_cache_ptr.type.element_ty
++            v_dtype = value_cache_ptr.type.element_ty
++            k_val = (k_val.to(tl.float32) / k_scale).to(k_dtype)
++            v_val = (v_val.to(tl.float32) / v_scale).to(v_dtype)
++        tl.store(key_cache_ptr + dst_k_shuffle_offset, k_val)
++        tl.store(value_cache_ptr + dst_v_shuffle_offset, v_val)
++
++    def reshape_and_cache_shuffle_triton(
++        key: torch.Tensor,
++        value: torch.Tensor,
++        key_cache: torch.Tensor,
++        value_cache: torch.Tensor,
++        slot_mapping: torch.Tensor,
++        kv_cache_dtype: str,
++        k_scales: torch.Tensor,
++        v_scales: torch.Tensor,
++    ):
++        num_tokens = slot_mapping.shape[0]
++        _, num_kv_heads, head_size = key.shape
++        num_blocks, block_size, _, _ = key_cache.shape
++        x = 16 // key_cache.element_size()
++        k_cache_template = torch.empty(
++            [num_blocks, num_kv_heads, head_size // x, block_size, x],
++            dtype=key_cache.dtype,
++            device="meta",
++        )
++        v_cache_template = torch.empty(
++            [num_blocks, num_kv_heads, block_size // x, head_size, x],
++            dtype=value_cache.dtype,
++            device="meta",
++        )
++        new_key_cache = key_cache.view_as(k_cache_template)
++        new_value_cache = value_cache.view_as(v_cache_template)
++        QUANT = False
++        if kv_cache_dtype.startswith("fp8"):
++            QUANT = True
++            
++        kv_cache_torch_dtype = (current_platform.fp8_dtype() if "fp8" in kv_cache_dtype else torch.int8)
++        new_key_cache = new_key_cache.view(kv_cache_torch_dtype)
++        new_value_cache = new_value_cache.view(kv_cache_torch_dtype)
++
++        # aiter.reshape_and_cache_with_pertoken_quant(
++        #     key, value, new_key_cache, new_value_cache, k_scales, v_scales, slot_mapping.flatten(), True)
++        
++            
++        grid = (
++            num_tokens,
++            num_kv_heads,
++        )
++        reshape_and_cache_shuffle_kernel[grid](
++            key,
++            value,
++            new_key_cache,
++            new_value_cache,
++            slot_mapping,
++            k_scales,
++            v_scales,
++            x,
++            key.stride(0),
++            value.stride(0),
++            block_size,
++            head_size,
++            num_kv_heads,
++            BLOCK_SIZE=head_size,
++            QUANT=QUANT,
++        )
++
+ 
+ logger = init_logger(__name__)
+ 
+@@ -726,7 +894,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
+                 token_to_batch=token_to_batch[chunk_idx],
+                 seq_starts=chunk_starts[chunk_idx],
+                 dequant=False,
+-                kv_cache_layout="NHD",
++                kv_cache_layout="SHUFFLE" if USING_SHUFFLE_LAYOUT else "NHD",
+                 total_tokens=total_token_per_batch[chunk_idx],
+             )
+ 
+@@ -836,18 +1004,40 @@ class AiterFlashAttentionImpl(AttentionImpl):
+             # the reshape_and_cache_flash op uses the slot_mapping's shape
+             # to determine the number of actual tokens.
+ 
+-            torch.ops._C_cache_ops.reshape_and_cache_flash(
+-                key,
+-                value,
+-                key_cache,
+-                value_cache,
+-                attn_metadata.slot_mapping,
+-                self.kv_cache_dtype,
+-                layer._k_scale,
+-                layer._v_scale,
+-            )
++            if USING_SHUFFLE_LAYOUT:
++                num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
++
++                k_scale, v_scale = get_static_kvscale(1.0, 1.0,  num_kv_heads,
++                        num_blocks,
++                        block_size,
++                        kv_cache.device)
++                
++                layer._k_scale = k_scale
++                layer._v_scale = v_scale
++                
++                reshape_and_cache_shuffle_triton(
++                    key,
++                    value,
++                    key_cache,
++                    value_cache,
++                    attn_metadata.slot_mapping,
++                    self.kv_cache_dtype,
++                    layer._k_scale,
++                    layer._v_scale,
++                )
++            else:
++                torch.ops._C_cache_ops.reshape_and_cache_flash(
++                    key,
++                    value,
++                    key_cache,
++                    value_cache,
++                    attn_metadata.slot_mapping,
++                    self.kv_cache_dtype,
++                    layer._k_scale,
++                    layer._v_scale,
++                )
+ 
+-        if self.kv_cache_dtype.startswith("fp8"):
++        if self.kv_cache_dtype.startswith("fp8") or self.kv_cache_dtype.startswith("fp4"):
+             key_cache = key_cache.view(current_platform.fp8_dtype())
+             value_cache = value_cache.view(current_platform.fp8_dtype())
+ 
+@@ -927,7 +1117,14 @@ class AiterFlashAttentionImpl(AttentionImpl):
+             # calculate for decodes
+             if num_decodes > 0:
+                 assert attn_metadata.decode_metadata is not None
++                #added logic for fp4
++                if self.kv_cache_dtype.startswith("fp4"):
++                    self.sliding_window[0] = -1
++
+                 if self.sliding_window[0] != -1:
++                    assert not USING_SHUFFLE_LAYOUT, (
++                        "Sliding window with shuffle layout is not supported yet."
++                    )
+                     from aiter.ops.triton.unified_attention import (
+                         unified_attention,
+                     )
+@@ -957,41 +1154,86 @@ class AiterFlashAttentionImpl(AttentionImpl):
+                     )
+                     return
+                 assert attn_metadata.decode_metadata is not None
+-                _, num_heads, head_size = query.shape
+-                nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
+-                num_seqs = attn_metadata.seq_lens.shape[0]
+-                max_num_partitions = (
+-                    attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
+-                ) // _PARTITION_SIZE_ROCM
+-
+-                workspace_buffer = torch.empty(
+-                    (num_seqs * num_heads * max_num_partitions * head_size)
+-                    * nbytes_per_qo_elem
+-                    + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
+-                    dtype=torch.uint8,
+-                    device=output.device,
+-                )
++                if USING_SHUFFLE_LAYOUT:
++                    num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
++                    x = 16 // key_cache.element_size()
++                    k_cache_template = torch.empty(
++                        [num_blocks, num_kv_heads, head_size // x, block_size, x],
++                        dtype=key_cache.dtype,
++                        device="meta",
++                    )
++                    v_cache_template = torch.empty(
++                        [num_blocks, num_kv_heads, block_size // x, head_size, x],
++                        dtype=value_cache.dtype,
++                        device="meta",
++                    )
++                    new_key_cache = key_cache.view_as(k_cache_template)
++                    new_value_cache = value_cache.view_as(v_cache_template)
++                    aiter.pa_fwd_asm(
++                        Q=query[:num_decode_tokens],
++                        K=new_key_cache,
++                        V=new_value_cache,
++                        block_tables=attn_metadata.block_table[:num_decodes],
++                        context_lens=attn_metadata.seq_lens[:num_decodes],
++                        block_tables_stride0=attn_metadata.block_table[
++                            :num_decodes
++                        ].stride(0),
++                        K_QScale=layer._k_scale,
++                        V_QScale=layer._v_scale,
++                        out_=output[:num_decode_tokens],
++                    )
++                else:
++                    _, num_heads, head_size = query.shape
++                    nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
++                    num_seqs = attn_metadata.seq_lens.shape[0]
++                    max_num_partitions = (
++                        attn_metadata.max_seq_len + _PARTITION_SIZE_ROCM - 1
++                    ) // _PARTITION_SIZE_ROCM
++
++                    workspace_buffer = torch.empty(
++                        (num_seqs * num_heads * max_num_partitions * head_size)
++                        * nbytes_per_qo_elem
++                        + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
++                        dtype=torch.uint8,
++                        device=output.device,
++                    )
+ 
+-                torch.ops.aiter.paged_attention_v1(
+-                    output[:num_decode_tokens],
+-                    workspace_buffer,
+-                    query[:num_decode_tokens],
+-                    key_cache,
+-                    value_cache,
+-                    self.scale,
+-                    attn_metadata.block_table[:num_decodes],
+-                    attn_metadata.query_start_loc[:num_decodes],
+-                    attn_metadata.seq_lens[:num_decodes],
+-                    attn_metadata.max_seq_len,
+-                    self.alibi_slopes,
+-                    self.kv_cache_dtype,
+-                    "NHD",
+-                    self.logits_soft_cap,
+-                    layer._k_scale,
+-                    layer._v_scale,
+-                    None,
+-                    _PARTITION_SIZE_ROCM,
+-                )
++                    if self.kv_cache_dtype.startswith("fp4"):
++                        num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
++                        x = 16 // key_cache.element_size()
++                        k_cache_template = torch.empty(
++                            [num_blocks, num_kv_heads, head_size // x, block_size, x],
++                            dtype=key_cache.dtype,
++                            device="meta",
++                        )
++                        v_cache_template = torch.empty(
++                            [num_blocks, num_kv_heads, head_size, block_size],
++                            dtype=value_cache.dtype,
++                            device="meta",
++                        )
++                        key_cache = key_cache.view_as(k_cache_template)
++                        value_cache = value_cache.view_as(v_cache_template)
++
++                    torch.ops.aiter.paged_attention_v1(
++                        output[:num_decode_tokens],
++                        workspace_buffer,
++                        query[:num_decode_tokens],
++                        key_cache,
++                        value_cache,
++                        self.scale,
++                        attn_metadata.block_table[:num_decodes],
++                        attn_metadata.query_start_loc[:num_decodes],
++                        attn_metadata.seq_lens[:num_decodes],
++                        attn_metadata.max_seq_len,
++                        self.alibi_slopes,
++                        self.kv_cache_dtype,
++                        "NHD",
++                        self.logits_soft_cap,
++                        layer._k_scale,
++                        layer._v_scale,
++                        None,
++                        _PARTITION_SIZE_ROCM,
++                    )
+         else:
+             raise NotImplementedError(
+                 "Cascade attention is not implemented for ROCM AITER"
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index bdd6d2a3c..a23e0a29a 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -224,6 +224,10 @@ class Scheduler(SchedulerInterface):
+         )
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
++        self.max_decode_step = envs.VLLM_SUBSEQUENT_DECODE_STEPS
++        self.min_request_for_decode = envs.VLLM_MIN_REQUEST_DECODE_STEP
++        self.current_step = 0
++        self.preemption_count = 0
+         self.perf_metrics: ModelMetrics | None = None
+         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
+             self.perf_metrics = ModelMetrics(vllm_config)
+@@ -360,6 +364,9 @@ class Scheduler(SchedulerInterface):
+                     if new_blocks is not None:
+                         # The request can be scheduled.
+                         break
++                    elif envs.VLLM_LOG_PREEMPTIONS:
++                        self.preemption_count = self.preemption_count + 1
++                        print(f"preemptions: {self.preemption_count}\n", flush=True)
+ 
+                     # The request cannot be scheduled.
+                     # Preempt the lowest-priority request.
+@@ -461,6 +468,10 @@ class Scheduler(SchedulerInterface):
+         # Next, schedule the WAITING requests.
+         if not preempted_reqs:
+             while self.waiting and token_budget > 0:
++                if (self.max_decode_step
++                        and self.current_step != 0
++                        and (len(self.running) >= self.min_request_for_decode)):
++                    break
+                 if len(self.running) == self.max_num_running_reqs:
+                     break
+ 
+@@ -795,6 +806,12 @@ class Scheduler(SchedulerInterface):
+ 
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
++        
++        if self.max_decode_step:
++            if self.current_step >= self.max_decode_step:
++                self.current_step = 0
++            else:
++                self.current_step = self.current_step + 1
+         return scheduler_output
+ 
+     def _preempt_request(self, request: Request, timestamp: float) -> None:
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index d5095af18..a7c20ec8b 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -25,12 +25,10 @@ class CudaGraphManager:
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+-        uses_mrope: bool,
+         device: torch.device,
+     ):
+         self.vllm_config = vllm_config
+         self.scheduler_config = vllm_config.scheduler_config
+-        self.uses_mrope = uses_mrope
+         self.device = device
+ 
+         self.max_model_len = vllm_config.model_config.max_model_len
+@@ -81,10 +79,7 @@ class CudaGraphManager:
+     ) -> None:
+         num_reqs = min(num_tokens, self.max_num_reqs)
+         input_ids = input_buffers.input_ids[:num_tokens]
+-        if not self.uses_mrope:
+-            positions = input_buffers.positions[:num_tokens]
+-        else:
+-            positions = input_buffers.mrope_positions[:, :num_tokens]
++        positions = input_buffers.positions[:num_tokens]
+         attn_metadata = prepare_inputs_to_capture(
+             num_reqs,
+             num_tokens,
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 8f9552e3f..78889d2ad 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -31,19 +31,6 @@ class InputBuffers:
+         )
+         self.seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+ 
+-        # NOTE: `mrope_positions` is implemented with one additional dummy
+-        # position on purpose to make it non-contiguous so that it can work
+-        # with torch compile.
+-        # See detailed explanation in https://github.com/vllm-project/vllm/pull/12128#discussion_r1926431923
+-        # NOTE: When M-RoPE is enabled, position ids are 3D regardless of
+-        # the modality of inputs. For text-only inputs, each dimension has
+-        # identical position IDs, making M-RoPE functionally equivalent to
+-        # 1D-RoPE.
+-        # See page 5 of https://arxiv.org/abs/2409.12191
+-        self.mrope_positions = torch.zeros(
+-            (3, max_num_tokens + 1), dtype=torch.int64, device=device
+-        )
+-
+ 
+ @dataclass
+ class InputBatch:
+@@ -75,8 +62,6 @@ class InputBatch:
+     input_ids: torch.Tensor
+     # [num_tokens_after_padding]
+     positions: torch.Tensor
+-    # [3, num_tokens_after_padding]
+-    mrope_positions: torch.Tensor
+ 
+     # layer_name -> Metadata
+     attn_metadata: dict[str, Any]
+@@ -122,11 +107,8 @@ class InputBatch:
+         input_buffers.query_start_loc[num_reqs + 1 :] = num_tokens
+         query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
+ 
+-        input_ids = input_buffers.input_ids[:num_tokens].zero_()
+-        positions = input_buffers.positions[:num_tokens].zero_()
+-        input_buffers.mrope_positions.zero_()
+-        mrope_positions = input_buffers.mrope_positions[:, :num_tokens]
+-
++        input_ids = input_buffers.input_ids[:num_tokens]
++        positions = input_buffers.positions[:num_tokens]
+         # attn_metadata = defaultdict(lambda: None)
+         logits_indices = query_start_loc[1:] - 1
+         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
+@@ -146,7 +128,6 @@ class InputBatch:
+             seq_lens=seq_lens,
+             input_ids=input_ids,
+             positions=positions,
+-            mrope_positions=mrope_positions,
+             attn_metadata=None,  # type: ignore
+             logits_indices=logits_indices,
+             cu_num_logits=cu_num_logits,
+diff --git a/vllm/v1/worker/gpu/mm/__init__.py b/vllm/v1/worker/gpu/mm/__init__.py
+deleted file mode 100644
+index e69de29bb..000000000
+diff --git a/vllm/v1/worker/gpu/mm/mrope_utils.py b/vllm/v1/worker/gpu/mm/mrope_utils.py
+deleted file mode 100644
+index c18b9c82e..000000000
+--- a/vllm/v1/worker/gpu/mm/mrope_utils.py
++++ /dev/null
+@@ -1,127 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-import torch
+-
+-from vllm.model_executor.models.interfaces import SupportsMRoPE
+-from vllm.triton_utils import tl, triton
+-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+-
+-
+-class MRopeState:
+-    def __init__(
+-        self,
+-        max_num_reqs: int,
+-        max_model_len: int,
+-        device: torch.device,
+-    ):
+-        self.max_num_reqs = max_num_reqs
+-        self.max_model_len = max_model_len
+-        self.device = device
+-
+-        # NOTE(woosuk): This tensor can be extremely large (e.g., several GBs)
+-        # wasting a lot of CPU memory.
+-        self.prefill_mrope_positions = StagedWriteTensor(
+-            (max_num_reqs, 3 * max_model_len),
+-            dtype=torch.int32,
+-            device=device,
+-            uva_instead_of_gpu=True,
+-        )
+-        self.prefill_mrope_delta = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
+-
+-    def init_prefill_mrope_positions(
+-        self,
+-        req_idx: int,
+-        mrope_model: SupportsMRoPE,
+-        prefill_token_ids: list[int],
+-        mm_features: list,
+-    ) -> None:
+-        prefill_mrope_positions, prefill_mrope_delta = (
+-            mrope_model.get_mrope_input_positions(
+-                prefill_token_ids,
+-                mm_features,
+-            )
+-        )
+-        for i in range(3):
+-            pos = prefill_mrope_positions[i].tolist()
+-            self.prefill_mrope_positions.stage_write(
+-                req_idx, i * self.max_model_len, pos
+-            )
+-        self.prefill_mrope_delta.np[req_idx] = prefill_mrope_delta
+-
+-    def apply_staged_writes(self) -> None:
+-        self.prefill_mrope_positions.apply_write()
+-        self.prefill_mrope_delta.copy_to_uva()
+-
+-    def prepare_mrope_positions(
+-        self,
+-        idx_mapping: torch.Tensor,
+-        query_start_loc: torch.Tensor,
+-        prefill_lens: torch.Tensor,
+-        num_computed_tokens: torch.Tensor,
+-        mrope_positions: torch.Tensor,
+-    ) -> None:
+-        num_reqs = idx_mapping.shape[0]
+-        _prepare_mrope_positions_kernel[(num_reqs,)](
+-            mrope_positions,
+-            mrope_positions.stride(0),
+-            self.prefill_mrope_positions.gpu,
+-            self.prefill_mrope_positions.gpu.stride(0),
+-            self.max_model_len,
+-            self.prefill_mrope_delta.gpu,
+-            idx_mapping,
+-            query_start_loc,
+-            prefill_lens,
+-            num_computed_tokens,
+-            BLOCK_SIZE=1024,
+-        )
+-
+-
+-@triton.jit
+-def _prepare_mrope_positions_kernel(
+-    mrope_positions_ptr,
+-    mrope_positions_stride,
+-    prefill_mrope_positions_ptr,
+-    prefill_mrope_positions_stride0,
+-    prefill_mrope_positions_stride1,
+-    prefill_mrope_delta_ptr,
+-    idx_mapping_ptr,
+-    query_start_loc_ptr,
+-    prefill_lens_ptr,
+-    num_computed_tokens_ptr,
+-    BLOCK_SIZE: tl.constexpr,
+-):
+-    batch_idx = tl.program_id(0)
+-    req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
+-
+-    prefill_len = tl.load(prefill_lens_ptr + req_state_idx)
+-    num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
+-    is_prefill = num_computed < prefill_len
+-
+-    query_start = tl.load(query_start_loc_ptr + batch_idx)
+-    query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
+-    query_len = query_end - query_start
+-
+-    mrope_delta = tl.load(prefill_mrope_delta_ptr + req_state_idx)
+-    for i in range(0, query_len, BLOCK_SIZE):
+-        block = i + tl.arange(0, BLOCK_SIZE)
+-        mask = block < query_len
+-        orig_pos = num_computed + block
+-
+-        for j in tl.static_range(3):
+-            if is_prefill:
+-                # Read from pre-computed M-RoPE positions.
+-                pos = tl.load(
+-                    prefill_mrope_positions_ptr
+-                    + req_state_idx * prefill_mrope_positions_stride0
+-                    + j * prefill_mrope_positions_stride1
+-                    + orig_pos,
+-                    mask=mask,
+-                )
+-            else:
+-                # Apply M-RoPE delta.
+-                pos = orig_pos + mrope_delta
+-            tl.store(
+-                mrope_positions_ptr + j * mrope_positions_stride + query_start + block,
+-                pos,
+-                mask=mask,
+-            )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 7300357a1..06dc7467f 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -47,7 +47,6 @@ from vllm.v1.worker.gpu.input_batch import (
+     prepare_pos_seq_lens,
+     prepare_prefill_inputs,
+ )
+-from vllm.v1.worker.gpu.mm.mrope_utils import MRopeState
+ from vllm.v1.worker.gpu.sample.logprob import compute_prompt_logprobs
+ from vllm.v1.worker.gpu.sample.metadata import SamplingMetadata
+ from vllm.v1.worker.gpu.sample.output import SamplerOutput
+@@ -95,15 +94,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+         self.max_num_reqs = self.scheduler_config.max_num_seqs
+         self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
+ 
+-        # Multimodal
+-        self.uses_mrope = self.model_config.uses_mrope
+-        if self.uses_mrope:
+-            self.mrope_states = MRopeState(
+-                max_num_reqs=self.max_num_reqs,
+-                max_model_len=self.max_model_len,
+-                device=self.device,
+-            )
+-
+         self.use_async_scheduling = self.scheduler_config.async_scheduling
+         self.output_copy_stream = torch.cuda.Stream(self.device)
+         self.output_copy_event = torch.cuda.Event()
+@@ -142,9 +132,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+ 
+         # CUDA graphs.
+-        self.cudagraph_manager = CudaGraphManager(
+-            self.vllm_config, self.uses_mrope, self.device
+-        )
++        self.cudagraph_manager = CudaGraphManager(self.vllm_config, self.device)
+         # Structured outputs worker.
+         self.structured_outputs_worker = StructuredOutputsWorker(
+             max_num_logits=self.max_num_reqs * (self.num_speculative_steps + 1),
+@@ -280,10 +268,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+         dp_size = self.parallel_config.data_parallel_size
+         num_tokens_across_dp = make_num_tokens_across_dp(dp_size, num_tokens)
+         num_sampled_tokens = np.ones(input_batch.num_reqs, dtype=np.int32)
+-        if not self.uses_mrope:
+-            positions = input_batch.positions
+-        else:
+-            positions = input_batch.mrope_positions
+         with (
+             self.maybe_dummy_run_with_lora(
+                 self.lora_config,
+@@ -299,7 +283,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+         ):
+             hidden_states = self.model(
+                 input_ids=input_batch.input_ids,
+-                positions=positions,
++                positions=input_batch.positions,
+             )
+             sample_hidden_states = hidden_states[input_batch.logits_indices]
+         return hidden_states, sample_hidden_states
+@@ -409,17 +393,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+                 sampling_params=new_req_data.sampling_params,
+                 lora_request=new_req_data.lora_request,
+             )
+-            req_index = self.req_states.req_id_to_index[req_id]
+-
+-            # Pre-compute M-RoPE positions for prefill.
+-            if self.uses_mrope:
+-                self.mrope_states.init_prefill_mrope_positions(
+-                    req_index,
+-                    self.model,  # type: ignore
+-                    new_req_data.prefill_token_ids,
+-                    mm_features=[],  # TODO
+-                )
+ 
++            req_index = self.req_states.req_id_to_index[req_id]
+             self.block_tables.append_block_ids(
+                 req_index, new_req_data.block_ids, overwrite=True
+             )
+@@ -436,8 +411,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+ 
+         self.req_states.apply_staged_writes()
+         self.block_tables.apply_staged_writes()
+-        if self.uses_mrope:
+-            self.mrope_states.apply_staged_writes()
+ 
+     def prepare_inputs(
+         self,
+@@ -538,16 +511,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+         )
+         seq_lens = self.input_buffers.seq_lens[:num_reqs]
+ 
+-        # Prepare M-RoPE positions.
+-        if self.uses_mrope:
+-            self.mrope_states.prepare_mrope_positions(
+-                idx_mapping,
+-                query_start_loc,
+-                self.req_states.prefill_len.gpu,
+-                self.req_states.num_computed_tokens.gpu,
+-                self.input_buffers.mrope_positions,
+-            )
+-
+         # Some input token ids are directly read from the last sampled tokens
+         # and draft tokens. Also, get the logits indices to sample tokens from.
+         logits_indices = combine_sampled_and_draft_tokens(
+@@ -583,9 +546,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+ 
+         input_ids = self.input_buffers.input_ids[:num_tokens_after_padding]
+         positions = self.input_buffers.positions[:num_tokens_after_padding]
+-        mrope_positions = self.input_buffers.mrope_positions[
+-            :, :num_tokens_after_padding
+-        ]
+         return InputBatch(
+             req_ids=req_ids,
+             num_reqs=num_reqs,
+@@ -601,7 +561,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+             seq_lens=seq_lens,
+             input_ids=input_ids,
+             positions=positions,
+-            mrope_positions=mrope_positions,
+             attn_metadata=attn_metadata,
+             logits_indices=logits_indices,
+             cu_num_logits=cu_num_logits,
+@@ -930,10 +889,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+         else:
+             # Run PyTorch model in eager mode.
+             # TODO(woosuk): Support piecewise CUDA graph.
+-            if not self.uses_mrope:
+-                positions = input_batch.positions
+-            else:
+-                positions = input_batch.mrope_positions
+             with set_forward_context(
+                 input_batch.attn_metadata,
+                 self.vllm_config,
+@@ -943,7 +898,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+             ):
+                 hidden_states = self.model(
+                     input_ids=input_batch.input_ids,
+-                    positions=positions,
++                    positions=input_batch.positions,
+                 )
+ 
+         self.execute_model_state = hidden_states, input_batch, sampling_metadata
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 562664524..b12256c0c 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -101,6 +101,10 @@ class Worker(WorkerBase):
+             )
+         elif profiler_config.profiler == "cuda":
+             self.profiler = CudaProfilerWrapper(profiler_config)
++        elif envs.ENABLE_TRACING_RPD:
++            from rpdTracerControl import rpdTracerControl
++            rpdTracerControl.setFilename(name=os.environ["RPDT_FILENAME"], append=True)
++            self.profiler = rpdTracerControl()
+         else:
+             self.profiler = None
+ 
+@@ -549,7 +553,7 @@ class Worker(WorkerBase):
+         # add trace annotation so that we can easily distinguish
+         # context/generation request numbers in each iteration.
+         # A context request is a request that has not yet generated any tokens
+-        if not self.profiler:
++        if not self.profiler or envs.ENABLE_TRACING_RPD:
+             return nullcontext()
+ 
+         self.profiler.step()
+@@ -626,9 +630,15 @@ class Worker(WorkerBase):
+             intermediate_tensors = IntermediateTensors(tensor_dict)
+ 
+         with self.annotate_profile(scheduler_output):
++            if envs.ENABLE_TRACING_RPD:
++                num_new = len(scheduler_output.scheduled_new_reqs)
++                num_cached = len(scheduler_output.scheduled_cached_reqs.req_ids)
++                self.profiler.rangePush("python",  f"execute_new_{num_new}_cached_{num_cached}", f"")
+             output = self.model_runner.execute_model(
+                 scheduler_output, intermediate_tensors
+             )
++            if envs.ENABLE_TRACING_RPD:
++                self.profiler.rangePop()
+             if isinstance(
+                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+             ):
+@@ -662,8 +672,14 @@ class Worker(WorkerBase):
+             )
+         if is_start:
+             self.profiler.start()
++            if envs.ENABLE_TRACING_RPD:
++                self.profiler.rangePush("python", f"profile", f"")
+         else:
++            if envs.ENABLE_TRACING_RPD:
++                self.profiler.rangePop()
+             self.profiler.stop()
++            if envs.ENABLE_TRACING_RPD:
++                self.profiler.flush()
+ 
+     def execute_dummy_batch(self) -> None:
+         if self.use_v2_model_runner:
+@@ -933,7 +949,10 @@ class Worker(WorkerBase):
+         if runner := getattr(self, "model_runner", None):
+             runner.ensure_kv_transfer_shutdown()
+         if self.profiler is not None:
+-            self.profiler.shutdown()
++            if envs.ENABLE_TRACING_RPD:
++                self.profiler.flush()
++            else:
++                self.profiler.shutdown()
+ 
+ 
+ def init_worker_distributed_environment(

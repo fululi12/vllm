@@ -101,6 +101,10 @@ class Worker(WorkerBase):
             )
         elif profiler_config.profiler == "cuda":
             self.profiler = CudaProfilerWrapper(profiler_config)
+        elif envs.ENABLE_TRACING_RPD:
+            from rpdTracerControl import rpdTracerControl
+            rpdTracerControl.setFilename(name=os.environ["RPDT_FILENAME"], append=True)
+            self.profiler = rpdTracerControl()
         else:
             self.profiler = None
 
@@ -549,7 +553,7 @@ class Worker(WorkerBase):
         # add trace annotation so that we can easily distinguish
         # context/generation request numbers in each iteration.
         # A context request is a request that has not yet generated any tokens
-        if not self.profiler:
+        if not self.profiler or envs.ENABLE_TRACING_RPD:
             return nullcontext()
 
         self.profiler.step()
@@ -626,9 +630,15 @@ class Worker(WorkerBase):
             intermediate_tensors = IntermediateTensors(tensor_dict)
 
         with self.annotate_profile(scheduler_output):
+            if envs.ENABLE_TRACING_RPD:
+                num_new = len(scheduler_output.scheduled_new_reqs)
+                num_cached = len(scheduler_output.scheduled_cached_reqs.req_ids)
+                self.profiler.rangePush("python",  f"execute_new_{num_new}_cached_{num_cached}", f"")
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+            if envs.ENABLE_TRACING_RPD:
+                self.profiler.rangePop()
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
@@ -662,8 +672,14 @@ class Worker(WorkerBase):
             )
         if is_start:
             self.profiler.start()
+            if envs.ENABLE_TRACING_RPD:
+                self.profiler.rangePush("python", f"profile", f"")
         else:
+            if envs.ENABLE_TRACING_RPD:
+                self.profiler.rangePop()
             self.profiler.stop()
+            if envs.ENABLE_TRACING_RPD:
+                self.profiler.flush()
 
     def execute_dummy_batch(self) -> None:
         if self.use_v2_model_runner:
@@ -933,7 +949,10 @@ class Worker(WorkerBase):
         if runner := getattr(self, "model_runner", None):
             runner.ensure_kv_transfer_shutdown()
         if self.profiler is not None:
-            self.profiler.shutdown()
+            if envs.ENABLE_TRACING_RPD:
+                self.profiler.flush()
+            else:
+                self.profiler.shutdown()
 
 
 def init_worker_distributed_environment(

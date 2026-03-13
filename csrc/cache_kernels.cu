@@ -129,6 +129,8 @@ struct CopyWithScaleOp {
   __device__ __forceinline__ void operator()(OutT& dst, const InT src) const {
     if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
       dst = static_cast<OutT>(src);
+    } else if constexpr (kv_dt == Fp8KVCacheDataType::kFp4E2M1) { // deal with FP4
+        dst = fp4::scaled_vec_conversion<Tout, Tin>(src, scale);
     } else {
       dst = fp8::scaled_convert<OutT, InT, kv_dt>(src, scale);
     }
@@ -805,6 +807,20 @@ void convert_fp8(torch::Tensor& dst_cache, torch::Tensor& src_cache,
     } else if (dst_cache.dtype() == at::ScalarType::BFloat16) {
       CALL_CONVERT_FP8(__nv_bfloat16, uint8_t,
                        vllm::Fp8KVCacheDataType::kFp8E4M3);
+    }
+  } else if (kv_cache_dtype == "fp4" || kv_cache_dtype == "fp4_e2m1") {
+    if (src_cache.dtype() == at::ScalarType::Float) {
+      FN(float, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
+    } else if (src_cache.dtype() == at::ScalarType::Half) {
+      FN(ck_tile::fp16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1); 
+    } else if (src_cache.dtype() == at::ScalarType::BFloat16) {
+      FN(ck_tile::bf16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
+    } else if (dst_cache.dtype() == at::ScalarType::Float) {
+      FN(uint8_t, float, vllm::Fp8KVCacheDataType::kFp4E2M1);
+    } else if (dst_cache.dtype() == at::ScalarType::Half) {
+      FN(uint8_t, ck_tile::fp16_t, vllm::Fp8KVCacheDataType::kFp4E2M1); 
+    } else if (dst_cache.dtype() == at::ScalarType::BFloat16) {
+      FN(uint8_t, ck_tile::bf16_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
     }
   } else {
     TORCH_CHECK(false, "Unsupported data type: ", kv_cache_dtype);

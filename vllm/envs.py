@@ -93,6 +93,10 @@ if TYPE_CHECKING:
     # See also vllm/config/profiler.py and `--profiler-config` argument
     VLLM_TORCH_CUDA_PROFILE: str | None = None
     VLLM_TORCH_PROFILER_DIR: str | None = None
+    ENABLE_TRACING_RPD: bool = False
+    VLLM_SUBSEQUENT_DECODE_STEPS: int = 0
+    VLLM_MIN_REQUEST_DECODE_STEP: int = 0
+    VLLM_LOG_PREEMPTIONS: bool = False
     VLLM_TORCH_PROFILER_RECORD_SHAPES: str | None = None
     VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY: str | None = None
     VLLM_TORCH_PROFILER_DISABLE_ASYNC_LLM: str | None = None
@@ -462,6 +466,18 @@ def get_vllm_port() -> int | None:
 logger = logging.getLogger(__name__)
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "ENABLE_TRACING_RPD": lambda: bool(
+        int(os.getenv("ENABLE_TRACING_RPD", "0"))
+    ),
+    "VLLM_SUBSEQUENT_DECODE_STEPS": lambda: int(
+        os.getenv("VLLM_SUBSEQUENT_DECODE_STEPS", "0")
+    ),
+    "VLLM_MIN_REQUEST_DECODE_STEP": lambda: int(
+        os.getenv("VLLM_MIN_REQUEST_DECODE_STEP", "0")
+    ),
+    "VLLM_LOG_PREEMPTIONS": lambda: bool(
+        int(os.getenv("VLLM_LOG_PREEMPTIONS", "0"))
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]

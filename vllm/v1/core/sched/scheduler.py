@@ -224,6 +224,10 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        self.max_decode_step = envs.VLLM_SUBSEQUENT_DECODE_STEPS
+        self.min_request_for_decode = envs.VLLM_MIN_REQUEST_DECODE_STEP
+        self.current_step = 0
+        self.preemption_count = 0
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -360,6 +364,9 @@ class Scheduler(SchedulerInterface):
                     if new_blocks is not None:
                         # The request can be scheduled.
                         break
+                    elif envs.VLLM_LOG_PREEMPTIONS:
+                        self.preemption_count = self.preemption_count + 1
+                        print(f"preemptions: {self.preemption_count}\n", flush=True)
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -461,6 +468,10 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
+                if (self.max_decode_step
+                        and self.current_step != 0
+                        and (len(self.running) >= self.min_request_for_decode)):
+                    break
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -795,6 +806,12 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        
+        if self.max_decode_step:
+            if self.current_step >= self.max_decode_step:
+                self.current_step = 0
+            else:
+                self.current_step = self.current_step + 1
         return scheduler_output
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:

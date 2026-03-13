@@ -15,6 +15,7 @@ enum class Fp8KVCacheDataType {
   kAuto = 0,
   kFp8E4M3 = 1,
   kFp8E5M2 = 2,
+  kFp4E2M1 = 3,  // FP4 E2M1 (MXFP4) format, supported on gfx950+
 };
 
 // fp8 vector types for quantization of kv cache

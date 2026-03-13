@@ -15,7 +15,7 @@ from vllm.utils.hashing import safe_hash
 
 logger = init_logger(__name__)
 
-ProfilerKind = Literal["torch", "cuda"]
+ProfilerKind = Literal["torch", "cuda", "rpd"]
 
 
 @config
