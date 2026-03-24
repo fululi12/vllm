@@ -78,6 +78,41 @@ _NVFP4_OP_CHECKED = False
 # fp4_num_k/v_blocks <= -_NVFP4_SIGNAL_OFFSET → NVFP4 E4M3 mode
 _NVFP4_SIGNAL_OFFSET = 1000
 
+# AMXFP4 (Asymmetric Microscaling FP4) block-scale mode for FP4 KV cache.
+# Based on arXiv:2411.09909, the Block Maximum (BM) element uses E0M3 encoding
+# (3 mantissa bits) for higher outlier precision, while all other elements use
+# standard E2M1.  A 1-byte BM index per block adds only 0.25 bits/element
+# overhead, recovering ~90% of the MXFP4→BF16 accuracy gap.
+# Uses E8M0 shared scales (same as MXFP4) plus BM index metadata.
+# Set VLLM_FP4_AMXFP4=1 to enable.
+_FP4_AMXFP4 = os.environ.get("VLLM_FP4_AMXFP4", "0") == "1"
+_AMXFP4_OP_CHECKED = False
+
+# Signal offset for PA kernel to distinguish AMXFP4 from NVFP4/MXFP4.
+# fp4_num_k/v_blocks <= -_AMXFP4_SIGNAL_OFFSET → AMXFP4 mode
+_AMXFP4_SIGNAL_OFFSET = 2000
+
+
+def _ensure_amxfp4_op_available():
+    """Lazy check: disable AMXFP4 mode if the C++ op wasn't compiled."""
+    global _FP4_AMXFP4, _AMXFP4_OP_CHECKED
+    if _AMXFP4_OP_CHECKED:
+        return
+    _AMXFP4_OP_CHECKED = True
+    if not _FP4_AMXFP4:
+        return
+    if not hasattr(torch.ops, "_C_cache_ops") or not hasattr(
+        torch.ops._C_cache_ops, "reshape_and_cache_flash_fp4_amxfp4"
+    ):
+        logger.warning(
+            "VLLM_FP4_AMXFP4=1 is set but reshape_and_cache_flash_fp4_amxfp4 "
+            "is not available in the compiled C++ extension. "
+            "Falling back to NVFP4/MXFP4/per-token mode. Please rebuild vLLM "
+            "with the updated C++ files "
+            "(cache.h, cache_kernels.cu, torch_bindings.cpp)."
+        )
+        _FP4_AMXFP4 = False
+
 
 def _ensure_nvfp4_op_available():
     """Lazy check: disable NVFP4 mode if the C++ op wasn't compiled."""
@@ -488,6 +523,77 @@ def _get_or_create_fp4_nvfp4_scales(
     return k_flat, v_flat, k_2d, v_2d
 
 
+def _get_or_create_fp4_amxfp4_scales(
+    layer: torch.nn.Module,
+    num_kv_heads: int,
+    total_tokens: int,
+    device,
+    head_size: int = 128,
+):
+    """Allocate (once) AMXFP4 E8M0 scale + BM index buffers as uint8.
+
+    For the PA kernel, scales and BM indices are packed into a single buffer
+    per K/V with doubled row count:
+      - Rows [0, num_blocks) : E8M0 shared scales
+      - Rows [num_blocks, 2*num_blocks) : BM indices (0-31)
+
+    Returns (k_scales_2d, v_scales_2d, k_bm_2d, v_bm_2d, k_packed_2d, v_packed_2d).
+    The *_packed_2d tensors are for the PA kernel (concatenated scales + BM idx).
+    """
+    if hasattr(layer, "_fp4_amxfp4_k_scales_2d"):
+        return (
+            layer._fp4_amxfp4_k_scales_2d,
+            layer._fp4_amxfp4_v_scales_2d,
+            layer._fp4_amxfp4_k_bm_2d,
+            layer._fp4_amxfp4_v_bm_2d,
+            layer._fp4_amxfp4_k_packed_2d,
+            layer._fp4_amxfp4_v_packed_2d,
+        )
+
+    num_blocks = max(1, head_size // FP4_QUANT_BLOCK_SIZE)
+
+    k_scale_flat = torch.zeros(
+        num_kv_heads * num_blocks * total_tokens,
+        dtype=torch.uint8, device=device)
+    k_scales_2d = k_scale_flat.view(num_kv_heads * num_blocks, total_tokens)
+
+    k_bm_flat = torch.zeros(
+        num_kv_heads * num_blocks * total_tokens,
+        dtype=torch.uint8, device=device)
+    k_bm_2d = k_bm_flat.view(num_kv_heads * num_blocks, total_tokens)
+
+    v_scale_flat = torch.zeros(
+        num_kv_heads * num_blocks * total_tokens,
+        dtype=torch.uint8, device=device)
+    v_scales_2d = v_scale_flat.view(num_kv_heads * num_blocks, total_tokens)
+
+    v_bm_flat = torch.zeros(
+        num_kv_heads * num_blocks * total_tokens,
+        dtype=torch.uint8, device=device)
+    v_bm_2d = v_bm_flat.view(num_kv_heads * num_blocks, total_tokens)
+
+    k_packed = torch.zeros(
+        num_kv_heads * num_blocks * 2, total_tokens,
+        dtype=torch.uint8, device=device)
+    v_packed = torch.zeros(
+        num_kv_heads * num_blocks * 2, total_tokens,
+        dtype=torch.uint8, device=device)
+
+    layer._fp4_amxfp4_k_scales_2d = k_scales_2d
+    layer._fp4_amxfp4_v_scales_2d = v_scales_2d
+    layer._fp4_amxfp4_k_bm_2d = k_bm_2d
+    layer._fp4_amxfp4_v_bm_2d = v_bm_2d
+    layer._fp4_amxfp4_k_packed_2d = k_packed
+    layer._fp4_amxfp4_v_packed_2d = v_packed
+    layer._fp4_num_k_blocks = num_blocks
+    layer._fp4_num_v_blocks = num_blocks
+    layer._fp4_k_scale_stride_h = num_blocks * 2 * total_tokens
+    layer._fp4_v_scale_stride_h = num_blocks * 2 * total_tokens
+    layer._fp4_amxfp4_active = True
+
+    return k_scales_2d, v_scales_2d, k_bm_2d, v_bm_2d, k_packed, v_packed
+
+
 if current_platform.is_rocm():
     import aiter
 
@@ -674,25 +780,81 @@ if current_platform.is_rocm():
             is_uint8_k = k_dequant_scales_2d.dtype == torch.uint8
             is_uint8_v = v_dequant_scales_2d.dtype == torch.uint8
             is_nvfp4_mode = _FP4_NVFP4
+            is_amxfp4_mode = _FP4_AMXFP4
 
             if is_per_channel_k:
                 k_out = k_out * k_dequant_scales_2d.unsqueeze(0)
             elif is_uint8_k:
-                num_k_blocks = k_dequant_scales_2d.shape[0] // num_heads
-                k_sc_raw = k_dequant_scales_2d[:, physical_slot_idx]
-                if is_nvfp4_mode:
-                    k_sc_float = _fp8_e4m3_to_float(k_sc_raw)
-                else:
+                if is_amxfp4_mode:
+                    num_k_blocks = k_dequant_scales_2d.shape[0] // \
+                        (num_heads * 2)
+                    total_krows = num_heads * num_k_blocks
+                    k_e8m0_raw = k_dequant_scales_2d[
+                        :total_krows, physical_slot_idx]
+                    k_bm_raw = k_dequant_scales_2d[
+                        total_krows:, physical_slot_idx]
                     k_sc_float = torch.pow(
-                        2.0, k_sc_raw.float() - 127.0
-                    )
-                k_sc_float = k_sc_float.reshape(
-                    num_heads, num_k_blocks, total_tokens
-                ).permute(2, 0, 1)
-                k_scales = k_sc_float.repeat_interleave(
-                    FP4_QUANT_BLOCK_SIZE, dim=-1
-                )
-                k_out = k_out * k_scales
+                        2.0, k_e8m0_raw.float() - 127.0)
+                    k_sc_float = k_sc_float.reshape(
+                        num_heads, num_k_blocks, total_tokens
+                    ).permute(2, 0, 1)
+                    k_scales = k_sc_float.repeat_interleave(
+                        FP4_QUANT_BLOCK_SIZE, dim=-1)
+                    k_out = k_out * k_scales
+
+                    bm_lut = torch.tensor(
+                        [4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5,
+                         -4.0, -4.5, -5.0, -5.5, -6.0, -6.5, -7.0,
+                         -7.5],
+                        dtype=torch.float32, device=key.device)
+                    k_bm_idx = k_bm_raw.reshape(
+                        num_heads, num_k_blocks, total_tokens
+                    ).permute(2, 0, 1).long()
+                    for blk in range(num_k_blocks):
+                        blk_start = blk * FP4_QUANT_BLOCK_SIZE
+                        bm_pos = k_bm_idx[:, :, blk]
+                        global_pos = blk_start + bm_pos
+                        packed_byte_idx = global_pos // 2
+                        nib_in_byte = global_pos % 2
+                        raw_byte = packed_k[
+                            torch.arange(total_tokens,
+                                         device=key.device
+                                         ).unsqueeze(1),
+                            torch.arange(num_heads,
+                                         device=key.device
+                                         ).unsqueeze(0),
+                            packed_byte_idx]
+                        nibble = torch.where(
+                            nib_in_byte == 0,
+                            raw_byte & 0x0F,
+                            (raw_byte >> 4) & 0x0F).long()
+                        bm_correct = bm_lut[nibble]
+                        scale_at_bm = k_sc_float[:, :, blk]
+                        corrected = bm_correct * scale_at_bm
+                        k_out[
+                            torch.arange(total_tokens,
+                                         device=key.device
+                                         ).unsqueeze(1),
+                            torch.arange(num_heads,
+                                         device=key.device
+                                         ).unsqueeze(0),
+                            global_pos] = corrected
+                else:
+                    num_k_blocks = k_dequant_scales_2d.shape[0] // \
+                        num_heads
+                    k_sc_raw = k_dequant_scales_2d[
+                        :, physical_slot_idx]
+                    if is_nvfp4_mode:
+                        k_sc_float = _fp8_e4m3_to_float(k_sc_raw)
+                    else:
+                        k_sc_float = torch.pow(
+                            2.0, k_sc_raw.float() - 127.0)
+                    k_sc_float = k_sc_float.reshape(
+                        num_heads, num_k_blocks, total_tokens
+                    ).permute(2, 0, 1)
+                    k_scales = k_sc_float.repeat_interleave(
+                        FP4_QUANT_BLOCK_SIZE, dim=-1)
+                    k_out = k_out * k_scales
             else:
                 num_k_blocks = k_dequant_scales_2d.shape[0] // num_heads
                 if num_k_blocks > 1:
@@ -710,21 +872,76 @@ if current_platform.is_rocm():
                     k_out = k_out * k_scales
 
             if is_uint8_v:
-                num_v_blocks = v_dequant_scales_2d.shape[0] // num_heads
-                v_sc_raw = v_dequant_scales_2d[:, physical_slot_idx]
-                if is_nvfp4_mode:
-                    v_sc_float = _fp8_e4m3_to_float(v_sc_raw)
-                else:
+                if is_amxfp4_mode:
+                    num_v_blocks = v_dequant_scales_2d.shape[0] // \
+                        (num_heads * 2)
+                    total_vrows = num_heads * num_v_blocks
+                    v_e8m0_raw = v_dequant_scales_2d[
+                        :total_vrows, physical_slot_idx]
+                    v_bm_raw = v_dequant_scales_2d[
+                        total_vrows:, physical_slot_idx]
                     v_sc_float = torch.pow(
-                        2.0, v_sc_raw.float() - 127.0
-                    )
-                v_sc_float = v_sc_float.reshape(
-                    num_heads, num_v_blocks, total_tokens
-                ).permute(2, 0, 1)
-                v_scales = v_sc_float.repeat_interleave(
-                    FP4_QUANT_BLOCK_SIZE, dim=-1
-                )
-                v_out = v_out * v_scales
+                        2.0, v_e8m0_raw.float() - 127.0)
+                    v_sc_float = v_sc_float.reshape(
+                        num_heads, num_v_blocks, total_tokens
+                    ).permute(2, 0, 1)
+                    v_scales = v_sc_float.repeat_interleave(
+                        FP4_QUANT_BLOCK_SIZE, dim=-1)
+                    v_out = v_out * v_scales
+
+                    bm_lut_v = torch.tensor(
+                        [4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5,
+                         -4.0, -4.5, -5.0, -5.5, -6.0, -6.5, -7.0,
+                         -7.5],
+                        dtype=torch.float32, device=key.device)
+                    v_bm_idx = v_bm_raw.reshape(
+                        num_heads, num_v_blocks, total_tokens
+                    ).permute(2, 0, 1).long()
+                    for blk in range(num_v_blocks):
+                        blk_start = blk * FP4_QUANT_BLOCK_SIZE
+                        bm_pos = v_bm_idx[:, :, blk]
+                        global_pos = blk_start + bm_pos
+                        packed_byte_idx = global_pos // 2
+                        nib_in_byte = global_pos % 2
+                        raw_byte = packed_v[
+                            torch.arange(total_tokens,
+                                         device=key.device
+                                         ).unsqueeze(1),
+                            torch.arange(num_heads,
+                                         device=key.device
+                                         ).unsqueeze(0),
+                            packed_byte_idx]
+                        nibble = torch.where(
+                            nib_in_byte == 0,
+                            raw_byte & 0x0F,
+                            (raw_byte >> 4) & 0x0F).long()
+                        bm_correct = bm_lut_v[nibble]
+                        scale_at_bm = v_sc_float[:, :, blk]
+                        corrected = bm_correct * scale_at_bm
+                        v_out[
+                            torch.arange(total_tokens,
+                                         device=key.device
+                                         ).unsqueeze(1),
+                            torch.arange(num_heads,
+                                         device=key.device
+                                         ).unsqueeze(0),
+                            global_pos] = corrected
+                else:
+                    num_v_blocks = v_dequant_scales_2d.shape[0] // \
+                        num_heads
+                    v_sc_raw = v_dequant_scales_2d[
+                        :, physical_slot_idx]
+                    if is_nvfp4_mode:
+                        v_sc_float = _fp8_e4m3_to_float(v_sc_raw)
+                    else:
+                        v_sc_float = torch.pow(
+                            2.0, v_sc_raw.float() - 127.0)
+                    v_sc_float = v_sc_float.reshape(
+                        num_heads, num_v_blocks, total_tokens
+                    ).permute(2, 0, 1)
+                    v_scales = v_sc_float.repeat_interleave(
+                        FP4_QUANT_BLOCK_SIZE, dim=-1)
+                    v_out = v_out * v_scales
             else:
                 num_v_blocks = v_dequant_scales_2d.shape[0] // num_heads
                 if num_v_blocks > 1:
@@ -1608,6 +1825,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             if self.kv_cache_dtype.startswith("fp4") and getattr(
                 layer, "fp4_per_token_quant", False
             ):
+                _ensure_amxfp4_op_available()
                 _ensure_nvfp4_op_available()
                 num_kv_heads = key_cache.size(2)
                 total_tokens = key_cache.size(0) * key_cache.size(1)
@@ -1623,7 +1841,35 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     cache_value = _hadamard_rotate(
                         value, signs).to(value.dtype)
 
-                if _FP4_NVFP4:
+                if _FP4_AMXFP4:
+                    (
+                        k_scales_2d, v_scales_2d,
+                        k_bm_2d, v_bm_2d,
+                        k_packed_2d, v_packed_2d,
+                    ) = _get_or_create_fp4_amxfp4_scales(
+                        layer, num_kv_heads, total_tokens,
+                        key_cache.device, head_size,
+                    )
+                    torch.ops._C_cache_ops \
+                        .reshape_and_cache_flash_fp4_amxfp4(
+                            cache_key,
+                            cache_value,
+                            key_cache,
+                            value_cache,
+                            k_scales_2d,
+                            v_scales_2d,
+                            k_bm_2d,
+                            v_bm_2d,
+                            attn_metadata.slot_mapping,
+                            self.kv_cache_dtype,
+                        )
+                    num_blk = layer._fp4_num_k_blocks
+                    num_h = num_kv_heads
+                    k_packed_2d[:num_h * num_blk, :].copy_(k_scales_2d)
+                    k_packed_2d[num_h * num_blk:, :].copy_(k_bm_2d)
+                    v_packed_2d[:num_h * num_blk, :].copy_(v_scales_2d)
+                    v_packed_2d[num_h * num_blk:, :].copy_(v_bm_2d)
+                elif _FP4_NVFP4:
                     (
                         k_fp8_flat, v_fp8_flat,
                         k_fp8_2d, v_fp8_2d,
@@ -1800,7 +2046,14 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 if self.kv_cache_dtype.startswith("fp4") and getattr(
                     layer, "fp4_per_token_quant", False
                 ):
-                    if _FP4_NVFP4 and hasattr(
+                    if _FP4_AMXFP4 and hasattr(
+                        layer, "_fp4_amxfp4_k_packed_2d"
+                    ):
+                        fp4_k_scales_2d = \
+                            layer._fp4_amxfp4_k_packed_2d
+                        fp4_v_scales_2d = \
+                            layer._fp4_amxfp4_v_packed_2d
+                    elif _FP4_NVFP4 and hasattr(
                         layer, "_fp4_nvfp4_k_scales_2d"
                     ):
                         fp4_k_scales_2d = \
@@ -1940,10 +2193,31 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     fp4_per_channel_k_active = False
                     fp4_mxfp4_active = False
                     fp4_nvfp4_active = False
+                    fp4_amxfp4_active = False
                     if self.kv_cache_dtype.startswith("fp4") and getattr(
                         layer, "fp4_per_token_quant", False
                     ):
-                        if _FP4_NVFP4 and hasattr(
+                        if _FP4_AMXFP4 and hasattr(
+                            layer, "_fp4_amxfp4_k_packed_2d"
+                        ):
+                            fp4_amxfp4_active = True
+                            k_scale_for_pa = \
+                                layer._fp4_amxfp4_k_packed_2d \
+                                    .contiguous().view(-1)
+                            v_scale_for_pa = \
+                                layer._fp4_amxfp4_v_packed_2d \
+                                    .contiguous().view(-1)
+                            k_scale_stride_h = \
+                                layer._fp4_k_scale_stride_h
+                            v_scale_stride_h = \
+                                layer._fp4_v_scale_stride_h
+                            num_k_blks = layer._fp4_num_k_blocks
+                            num_v_blks = layer._fp4_num_v_blocks
+                            fp4_num_k_blocks = \
+                                -(num_k_blks + _AMXFP4_SIGNAL_OFFSET)
+                            fp4_num_v_blocks = \
+                                -(num_v_blks + _AMXFP4_SIGNAL_OFFSET)
+                        elif _FP4_NVFP4 and hasattr(
                             layer, "_fp4_nvfp4_k_scales_flat"
                         ):
                             fp4_nvfp4_active = True
@@ -2077,3 +2351,4 @@ class AiterFlashAttentionImpl(AttentionImpl):
             )
 
         return output
+

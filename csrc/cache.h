@@ -70,6 +70,20 @@ void reshape_and_cache_flash_fp4_nvfp4(
     torch::Tensor& slot_mapping,     // [num_tokens]
     const std::string& kv_cache_dtype);
 
+void reshape_and_cache_flash_fp4_amxfp4(
+    torch::Tensor& key,              // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,            // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, block_size, num_heads,
+                                     //  head_size/2]
+    torch::Tensor& value_cache,      // [num_blocks, block_size, num_heads,
+                                     //  head_size/2]
+    torch::Tensor& k_e8m0_scales,    // [num_heads*num_k_blocks, total] uint8
+    torch::Tensor& v_e8m0_scales,    // [num_heads*num_v_blocks, total] uint8
+    torch::Tensor& k_bm_indices,     // [num_heads*num_k_blocks, total] uint8
+    torch::Tensor& v_bm_indices,     // [num_heads*num_v_blocks, total] uint8
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const std::string& kv_cache_dtype);
+
 void concat_and_cache_mla(torch::Tensor& kv_c, torch::Tensor& k_pe,
                           torch::Tensor& kv_cache, torch::Tensor& slot_mapping,
                           const std::string& kv_cache_dtype,
@@ -128,3 +142,4 @@ void cp_gather_indexer_k_quant_cache(
     torch::Tensor& dst_scale,  // [num_tokens, head_dim / quant_block_size * 4]
     const torch::Tensor& block_table,   // [batch_size, num_blocks]
     const torch::Tensor& cu_seq_lens);  // [batch_size + 1]
+

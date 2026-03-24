@@ -964,6 +964,41 @@ __inline__ __device__ float fp8_e4m3_to_float(uint8_t x) {
          * (1.0f + static_cast<float>(mantissa) / 8.0f);
 }
 
+// ---------------------------------------------------------------------------
+// AMXFP4 (Asymmetric Microscaling FP4) helpers.
+//
+// AMXFP4 repurposes the Block Maximum (BM) element's 2 exponent bits as
+// extra mantissa bits (E0M3 encoding: 1 sign + 3 mantissa), giving 8
+// representable magnitudes {4.0,4.5,5.0,5.5,6.0,6.5,7.0,7.5} instead of
+// just {4.0,6.0} in standard E2M1.  Non-BM elements use standard E2M1.
+// A 1-byte metadata per block stores the BM index (0-31).
+// Reference: arXiv:2411.09909 "AMXFP4: Taming Activation Outliers with
+// Asymmetric Microscaling Floating-Point for 4-bit LLM Inference"
+// ---------------------------------------------------------------------------
+__constant__ float amxfp4_bm_lut[8] = {
+    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f
+};
+
+__inline__ __device__ uint8_t amxfp4_bm_quantize_nibble(float x) {
+  uint8_t sign = (x < 0.0f) ? 8 : 0;
+  float a = fabsf(x);
+  uint8_t mantissa;
+  if      (a < 4.25f)  mantissa = 0;
+  else if (a < 4.75f)  mantissa = 1;
+  else if (a < 5.25f)  mantissa = 2;
+  else if (a < 5.75f)  mantissa = 3;
+  else if (a < 6.25f)  mantissa = 4;
+  else if (a < 6.75f)  mantissa = 5;
+  else if (a < 7.25f)  mantissa = 6;
+  else                 mantissa = 7;
+  return sign | mantissa;
+}
+
+__inline__ __device__ float amxfp4_bm_dequant_value(uint8_t nibble) {
+  float mag = amxfp4_bm_lut[nibble & 0x7];
+  return (nibble & 0x8) ? -mag : mag;
+}
+
 // Per-token / per-block FP4 E2M1 quantization kernel for KV cache (NHD layout).
 //
 // Grid : (num_tokens, num_heads)  – one block per (token, head) pair.
@@ -2079,6 +2114,306 @@ __global__ void reshape_and_cache_flash_fp4_nvfp4_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// AMXFP4 (Asymmetric Microscaling FP4) cache write kernel.
+//
+// Uses E8M0 shared scales (like MXFP4) plus a 1-byte BM index per block.
+// The Block Maximum (BM) element is encoded with E0M3 (3 mantissa bits)
+// for higher precision, while all other elements use standard E2M1.
+// Achieves ~90% of the MXFP4→BF16 accuracy gap recovery with only
+// 0.25 bits/element overhead for the BM index metadata.
+//
+// Tensors stored:
+//   - FP4 packed data:  same layout as MXFP4
+//   - E8M0 scales:      [num_heads * num_blocks, total_tokens] uint8
+//   - BM indices:        [num_heads * num_blocks, total_tokens] uint8
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void reshape_and_cache_flash_fp4_amxfp4_kernel(
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    uint8_t* __restrict__ key_cache,
+    uint8_t* __restrict__ value_cache,
+    uint8_t* __restrict__ k_e8m0_scales,
+    uint8_t* __restrict__ v_e8m0_scales,
+    uint8_t* __restrict__ k_bm_indices,
+    uint8_t* __restrict__ v_bm_indices,
+    const int64_t* __restrict__ slot_mapping,
+    const int64_t key_stride,
+    const int64_t value_stride,
+    const int head_size,
+    const int block_size,
+    const int num_blocks,
+    const int64_t block_stride,
+    const int64_t page_stride,
+    const int64_t head_stride,
+    const int64_t k_scale_stride_h,
+    const int64_t v_scale_stride_h,
+    const int num_k_quant_blocks,
+    const int num_v_quant_blocks) {
+
+  constexpr float FP4_MAX = 6.0f;
+  constexpr int LOCAL_DIM_ELEMS = 8;
+  constexpr int FP4_QUANT_BLOCK_SIZE = 32;
+  constexpr int MAX_BLOCKS = LOCAL_DIM_ELEMS * 2;
+
+  const int64_t token_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int lane_id = threadIdx.x;
+
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) return;
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  if (block_idx >= num_blocks || block_offset >= block_size) return;
+
+  const int half_head = head_size / 2;
+
+  const scalar_t* k_src =
+      key + token_idx * key_stride + head_idx * head_size;
+  const scalar_t* v_src =
+      value + token_idx * value_stride + head_idx * head_size;
+
+  // --- Phase A: load K/V elements into registers ---
+  float k_local[LOCAL_DIM_ELEMS];
+  float v_local[LOCAL_DIM_ELEMS];
+
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      k_local[i] = static_cast<float>(k_src[d]);
+      v_local[i] = static_cast<float>(v_src[d]);
+    } else {
+      k_local[i] = 0.0f;
+      v_local[i] = 0.0f;
+    }
+  }
+
+#if FP4_USE_IN_KERNEL_WHT
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      float sign = fp4_wht_sign(d);
+      k_local[i] *= sign;
+      v_local[i] *= sign;
+    }
+  }
+  for (int h = 1; h < warpSize && h < head_size; h *= 2) {
+    bool is_lower = (lane_id & h) == 0;
+#pragma unroll
+    for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+      if (lane_id + j * warpSize < head_size) {
+        float kp = __shfl_xor_sync(uint64_t(-1), k_local[j], h);
+        float vp = __shfl_xor_sync(uint64_t(-1), v_local[j], h);
+        k_local[j] = is_lower ? (k_local[j] + kp) : (kp - k_local[j]);
+        v_local[j] = is_lower ? (v_local[j] + vp) : (vp - v_local[j]);
+      }
+    }
+  }
+  for (int s = 1; s * warpSize < head_size; s *= 2) {
+#pragma unroll
+    for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+      int pj = j ^ s;
+      if (pj > j && pj < LOCAL_DIM_ELEMS
+          && lane_id + j  * warpSize < head_size
+          && lane_id + pj * warpSize < head_size) {
+        float ka = k_local[j] + k_local[pj];
+        float kb = k_local[j] - k_local[pj];
+        k_local[j]  = ka;
+        k_local[pj] = kb;
+        float va = v_local[j] + v_local[pj];
+        float vb = v_local[j] - v_local[pj];
+        v_local[j]  = va;
+        v_local[pj] = vb;
+      }
+    }
+  }
+  float wht_norm = rsqrtf(static_cast<float>(head_size));
+#pragma unroll
+  for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+    if (lane_id + j * warpSize < head_size) {
+      k_local[j] *= wht_norm;
+      v_local[j] *= wht_norm;
+    }
+  }
+#endif  // FP4_USE_IN_KERNEL_WHT
+
+  // --- Phase B: compute E8M0 scales and find BM indices per block ---
+  float k_block_scale_inv[MAX_BLOCKS];
+  float v_block_scale_inv[MAX_BLOCKS];
+  uint8_t k_e8m0_local[MAX_BLOCKS];
+  uint8_t v_e8m0_local[MAX_BLOCKS];
+  uint8_t k_bm_local[MAX_BLOCKS];
+  uint8_t v_bm_local[MAX_BLOCKS];
+
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      float k_abs = fabsf(k_local[i]);
+      int k_bm_pos = lane_id % FP4_QUANT_BLOCK_SIZE;
+      for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2) {
+        float other_abs = __shfl_xor_sync(uint64_t(-1), k_abs, off);
+        int other_pos = __shfl_xor_sync(uint64_t(-1), k_bm_pos, off);
+        if (other_abs > k_abs ||
+            (other_abs == k_abs && other_pos < k_bm_pos)) {
+          k_abs = other_abs;
+          k_bm_pos = other_pos;
+        }
+      }
+      float blk_lo_abs = __shfl_sync(uint64_t(-1), k_abs, 0);
+      float blk_hi_abs = __shfl_sync(
+          uint64_t(-1), k_abs, FP4_QUANT_BLOCK_SIZE);
+      int bm_lo = __shfl_sync(uint64_t(-1), k_bm_pos, 0);
+      int bm_hi = __shfl_sync(uint64_t(-1), k_bm_pos, FP4_QUANT_BLOCK_SIZE);
+
+      int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
+      int b1 = b0 + 1;
+      if (b0 < num_k_quant_blocks) {
+        float ideal = fmaxf(blk_lo_abs / FP4_MAX, 1e-30f);
+        k_e8m0_local[b0] = float_to_e8m0(ideal);
+        float scale = e8m0_to_float(k_e8m0_local[b0]);
+        k_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
+        k_bm_local[b0] = static_cast<uint8_t>(bm_lo);
+      }
+      if (b1 < num_k_quant_blocks) {
+        float ideal = fmaxf(blk_hi_abs / FP4_MAX, 1e-30f);
+        k_e8m0_local[b1] = float_to_e8m0(ideal);
+        float scale = e8m0_to_float(k_e8m0_local[b1]);
+        k_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
+        k_bm_local[b1] = static_cast<uint8_t>(bm_hi);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      float v_abs = fabsf(v_local[i]);
+      int v_bm_pos = lane_id % FP4_QUANT_BLOCK_SIZE;
+      for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2) {
+        float other_abs = __shfl_xor_sync(uint64_t(-1), v_abs, off);
+        int other_pos = __shfl_xor_sync(uint64_t(-1), v_bm_pos, off);
+        if (other_abs > v_abs ||
+            (other_abs == v_abs && other_pos < v_bm_pos)) {
+          v_abs = other_abs;
+          v_bm_pos = other_pos;
+        }
+      }
+      float blk_lo_abs = __shfl_sync(uint64_t(-1), v_abs, 0);
+      float blk_hi_abs = __shfl_sync(
+          uint64_t(-1), v_abs, FP4_QUANT_BLOCK_SIZE);
+      int bm_lo = __shfl_sync(uint64_t(-1), v_bm_pos, 0);
+      int bm_hi = __shfl_sync(uint64_t(-1), v_bm_pos, FP4_QUANT_BLOCK_SIZE);
+
+      int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
+      int b1 = b0 + 1;
+      if (b0 < num_v_quant_blocks) {
+        float ideal = fmaxf(blk_lo_abs / FP4_MAX, 1e-30f);
+        v_e8m0_local[b0] = float_to_e8m0(ideal);
+        float scale = e8m0_to_float(v_e8m0_local[b0]);
+        v_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
+        v_bm_local[b0] = static_cast<uint8_t>(bm_lo);
+      }
+      if (b1 < num_v_quant_blocks) {
+        float ideal = fmaxf(blk_hi_abs / FP4_MAX, 1e-30f);
+        v_e8m0_local[b1] = float_to_e8m0(ideal);
+        float scale = e8m0_to_float(v_e8m0_local[b1]);
+        v_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
+        v_bm_local[b1] = static_cast<uint8_t>(bm_hi);
+      }
+    }
+  }
+
+  // --- Store E8M0 scales and BM indices (uint8) ---
+  const int64_t k_blk_stride =
+      (num_k_quant_blocks > 1) ? (k_scale_stride_h / num_k_quant_blocks) : 0;
+  const int64_t v_blk_stride =
+      (num_v_quant_blocks > 1) ? (v_scale_stride_h / num_v_quant_blocks) : 0;
+  if (lane_id == 0) {
+    for (int b = 0; b < num_k_quant_blocks; b++) {
+      int64_t off = head_idx * k_scale_stride_h + b * k_blk_stride + slot_idx;
+      k_e8m0_scales[off] = k_e8m0_local[b];
+      k_bm_indices[off] = k_bm_local[b];
+    }
+    for (int b = 0; b < num_v_quant_blocks; b++) {
+      int64_t off = head_idx * v_scale_stride_h + b * v_blk_stride + slot_idx;
+      v_e8m0_scales[off] = v_e8m0_local[b];
+      v_bm_indices[off] = v_bm_local[b];
+    }
+  }
+
+  // --- Phase C: quantize to FP4 with AMXFP4 encoding and write to cache ---
+#if FP4_USE_IN_KERNEL_WHT
+  __shared__ float k_wht_smem_amx[512];
+  __shared__ float v_wht_smem_amx[512];
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      k_wht_smem_amx[d] = k_local[i];
+      v_wht_smem_amx[d] = v_local[i];
+    }
+  }
+#endif
+
+  uint8_t* k_dst = key_cache + block_idx * block_stride
+                    + block_offset * page_stride
+                    + head_idx * head_stride;
+  uint8_t* v_dst = value_cache + block_idx * block_stride
+                    + block_offset * page_stride
+                    + head_idx * head_stride;
+
+  for (int j = lane_id; j < half_head; j += warpSize) {
+    int d0 = 2 * j;
+    int d1 = d0 + 1;
+
+    int kb = d0 / FP4_QUANT_BLOCK_SIZE;
+    float k_sinv = k_block_scale_inv[kb];
+    int k_bm_idx = static_cast<int>(k_bm_local[kb]);
+    int d0_in_blk = d0 % FP4_QUANT_BLOCK_SIZE;
+    int d1_in_blk = d1 % FP4_QUANT_BLOCK_SIZE;
+
+#if FP4_USE_IN_KERNEL_WHT
+    float kf0 = k_wht_smem_amx[d0] * k_sinv;
+    float kf1 = k_wht_smem_amx[d1] * k_sinv;
+#else
+    float kf0 = static_cast<float>(k_src[d0]) * k_sinv;
+    float kf1 = static_cast<float>(k_src[d1]) * k_sinv;
+#endif
+    uint8_t kn0 = (d0_in_blk == k_bm_idx)
+        ? amxfp4_bm_quantize_nibble(kf0)
+        : fp4_e2m1_quantize_nibble(kf0);
+    uint8_t kn1 = (d1_in_blk == k_bm_idx)
+        ? amxfp4_bm_quantize_nibble(kf1)
+        : fp4_e2m1_quantize_nibble(kf1);
+    k_dst[j] = (kn0 & 0xF) | ((kn1 & 0xF) << 4);
+
+    int vb = d0 / FP4_QUANT_BLOCK_SIZE;
+    float v_sinv = v_block_scale_inv[vb];
+    int v_bm_idx = static_cast<int>(v_bm_local[vb]);
+
+#if FP4_USE_IN_KERNEL_WHT
+    float vf0 = v_wht_smem_amx[d0] * v_sinv;
+    float vf1 = v_wht_smem_amx[d1] * v_sinv;
+#else
+    float vf0 = static_cast<float>(v_src[d0]) * v_sinv;
+    float vf1 = static_cast<float>(v_src[d1]) * v_sinv;
+#endif
+    uint8_t vn0 = (d0_in_blk == v_bm_idx)
+        ? amxfp4_bm_quantize_nibble(vf0)
+        : fp4_e2m1_quantize_nibble(vf0);
+    uint8_t vn1 = (d1_in_blk == v_bm_idx)
+        ? amxfp4_bm_quantize_nibble(vf1)
+        : fp4_e2m1_quantize_nibble(vf1);
+    v_dst[j] = (vn0 & 0xF) | ((vn1 & 0xF) << 4);
+  }
+}
+
 }  // namespace vllm
 #endif  // USE_ROCM
 
@@ -2359,6 +2694,119 @@ void reshape_and_cache_flash_fp4_nvfp4(
 #else
   TORCH_CHECK(false,
               "reshape_and_cache_flash_fp4_nvfp4 is only supported on ROCm");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// AMXFP4 (Asymmetric Microscaling FP4) cache write dispatch.
+//
+// Uses E8M0 shared scales (like MXFP4) plus a 1-byte BM index per block.
+// The Block Maximum element gets E0M3 encoding (3 mantissa bits) for
+// higher outlier precision.
+// ---------------------------------------------------------------------------
+void reshape_and_cache_flash_fp4_amxfp4(
+    torch::Tensor& key,              // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,            // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, block_size, num_heads, head_size/2]
+    torch::Tensor& value_cache,      // [num_blocks, block_size, num_heads, head_size/2]
+    torch::Tensor& k_e8m0_scales,    // [num_heads * num_k_blocks, max_kv_tokens] uint8
+    torch::Tensor& v_e8m0_scales,    // [num_heads * num_v_blocks, max_kv_tokens] uint8
+    torch::Tensor& k_bm_indices,     // [num_heads * num_k_blocks, max_kv_tokens] uint8
+    torch::Tensor& v_bm_indices,     // [num_heads * num_v_blocks, max_kv_tokens] uint8
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const std::string& kv_cache_dtype) {
+#ifdef USE_ROCM
+  TORCH_CHECK(kv_cache_dtype == "fp4" || kv_cache_dtype == "fp4_e2m1",
+              "reshape_and_cache_flash_fp4_amxfp4 only supports "
+              "fp4/fp4_e2m1, got: ", kv_cache_dtype);
+
+  int num_tokens = slot_mapping.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int block_size = key_cache.size(1);
+  int num_blocks = key_cache.size(0);
+  constexpr int FP4_QUANT_BLOCK_SIZE = 32;
+
+  TORCH_CHECK(head_size % 2 == 0,
+              "AMXFP4 requires even head_size, got ", head_size);
+  TORCH_CHECK(head_size % FP4_QUANT_BLOCK_SIZE == 0,
+              "AMXFP4 requires head_size divisible by 32, got ", head_size);
+  TORCH_CHECK(key_cache.dim() == 4,
+              "key_cache must be 4D [num_blocks, block_size, num_heads, "
+              "head_size/2]");
+  TORCH_CHECK(value_cache.dim() == 4 &&
+              value_cache.sizes() == key_cache.sizes(),
+              "value_cache must have same shape as key_cache");
+  TORCH_CHECK(key_cache.size(3) == head_size / 2,
+              "cache last dim must be head_size/2");
+  TORCH_CHECK(k_e8m0_scales.scalar_type() == at::ScalarType::Byte,
+              "k_e8m0_scales must be uint8 for AMXFP4 E8M0 scales");
+  TORCH_CHECK(v_e8m0_scales.scalar_type() == at::ScalarType::Byte,
+              "v_e8m0_scales must be uint8 for AMXFP4 E8M0 scales");
+  TORCH_CHECK(k_bm_indices.scalar_type() == at::ScalarType::Byte,
+              "k_bm_indices must be uint8 for AMXFP4 BM indices");
+  TORCH_CHECK(v_bm_indices.scalar_type() == at::ScalarType::Byte,
+              "v_bm_indices must be uint8 for AMXFP4 BM indices");
+
+  int num_k_quant_blocks = head_size / FP4_QUANT_BLOCK_SIZE;
+  int num_v_quant_blocks = head_size / FP4_QUANT_BLOCK_SIZE;
+
+  TORCH_CHECK(k_e8m0_scales.dim() == 2 &&
+              k_e8m0_scales.size(0) == num_heads * num_k_quant_blocks,
+              "k_e8m0_scales must be [num_heads*num_k_blocks, total_tokens]");
+  TORCH_CHECK(v_e8m0_scales.dim() == 2 &&
+              v_e8m0_scales.size(0) == num_heads * num_v_quant_blocks,
+              "v_e8m0_scales must be [num_heads*num_v_blocks, total_tokens]");
+  TORCH_CHECK(k_bm_indices.dim() == 2 &&
+              k_bm_indices.size(0) == num_heads * num_k_quant_blocks,
+              "k_bm_indices must be [num_heads*num_k_blocks, total_tokens]");
+  TORCH_CHECK(v_bm_indices.dim() == 2 &&
+              v_bm_indices.size(0) == num_heads * num_v_quant_blocks,
+              "v_bm_indices must be [num_heads*num_v_blocks, total_tokens]");
+
+  int64_t key_stride = key.stride(0);
+  int64_t value_stride = value.stride(0);
+  int64_t block_stride = key_cache.stride(0);
+  int64_t page_stride = key_cache.stride(1);
+  int64_t head_stride = key_cache.stride(2);
+  int64_t k_scale_stride_h = k_e8m0_scales.stride(0) * num_k_quant_blocks;
+  int64_t v_scale_stride_h = v_e8m0_scales.stride(0) * num_v_quant_blocks;
+
+  dim3 grid(num_tokens, num_heads);
+  dim3 block(64);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+#define LAUNCH_FP4_AMXFP4_KERNEL(scalar_type) \
+  vllm::reshape_and_cache_flash_fp4_amxfp4_kernel<scalar_type> \
+      <<<grid, block, 0, stream>>>( \
+          reinterpret_cast<scalar_type*>(key.data_ptr()), \
+          reinterpret_cast<scalar_type*>(value.data_ptr()), \
+          reinterpret_cast<uint8_t*>(key_cache.data_ptr()), \
+          reinterpret_cast<uint8_t*>(value_cache.data_ptr()), \
+          k_e8m0_scales.data_ptr<uint8_t>(), \
+          v_e8m0_scales.data_ptr<uint8_t>(), \
+          k_bm_indices.data_ptr<uint8_t>(), \
+          v_bm_indices.data_ptr<uint8_t>(), \
+          slot_mapping.data_ptr<int64_t>(), \
+          key_stride, value_stride, head_size, block_size, num_blocks, \
+          block_stride, page_stride, head_stride, \
+          k_scale_stride_h, v_scale_stride_h, \
+          num_k_quant_blocks, num_v_quant_blocks)
+
+  if (key.dtype() == at::ScalarType::Half) {
+    LAUNCH_FP4_AMXFP4_KERNEL(uint16_t);
+  } else if (key.dtype() == at::ScalarType::BFloat16) {
+    LAUNCH_FP4_AMXFP4_KERNEL(__nv_bfloat16);
+  } else if (key.dtype() == at::ScalarType::Float) {
+    LAUNCH_FP4_AMXFP4_KERNEL(float);
+  } else {
+    TORCH_CHECK(false, "Unsupported key/value dtype: ", key.dtype());
+  }
+#undef LAUNCH_FP4_AMXFP4_KERNEL
+#else
+  TORCH_CHECK(false,
+              "reshape_and_cache_flash_fp4_amxfp4 is only supported on ROCm");
 #endif
 }
 
@@ -3162,3 +3610,4 @@ void cp_gather_indexer_k_quant_cache(
     CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(32);
   }
 }
+

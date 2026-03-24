@@ -38,6 +38,21 @@ void reshape_and_cache_flash_fp4_nvfp4(
               "Please rebuild vLLM with the updated cache_kernels.cu.");
 }
 
+#ifdef __GNUC__
+__attribute__((weak))
+#endif
+void reshape_and_cache_flash_fp4_amxfp4(
+    torch::Tensor& key, torch::Tensor& value,
+    torch::Tensor& key_cache, torch::Tensor& value_cache,
+    torch::Tensor& k_e8m0_scales, torch::Tensor& v_e8m0_scales,
+    torch::Tensor& k_bm_indices, torch::Tensor& v_bm_indices,
+    torch::Tensor& slot_mapping,
+    const std::string& kv_cache_dtype) {
+  TORCH_CHECK(false,
+              "reshape_and_cache_flash_fp4_amxfp4 is not compiled. "
+              "Please rebuild vLLM with the updated cache_kernels.cu.");
+}
+
 // Note on op signatures:
 // The X_meta signatures are for the meta functions corresponding to op X.
 // They must be kept in sync with the signature for X. Generally, only
@@ -818,6 +833,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
                  torch::kCUDA,
                  &reshape_and_cache_flash_fp4_nvfp4);
 
+  cache_ops.def(
+      "reshape_and_cache_flash_fp4_amxfp4("
+      "    Tensor key, Tensor value,"
+      "    Tensor! key_cache, Tensor! value_cache,"
+      "    Tensor! k_e8m0_scales, Tensor! v_e8m0_scales,"
+      "    Tensor! k_bm_indices, Tensor! v_bm_indices,"
+      "    Tensor slot_mapping,"
+      "    str kv_cache_dtype) -> ()");
+  cache_ops.impl("reshape_and_cache_flash_fp4_amxfp4",
+                 torch::kCUDA,
+                 &reshape_and_cache_flash_fp4_amxfp4);
+
   // Concat kv_c and k_pe and cache them.
   cache_ops.def(
       "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"
@@ -946,3 +973,4 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
+
