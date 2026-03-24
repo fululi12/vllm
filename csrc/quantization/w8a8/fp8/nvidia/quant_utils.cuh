@@ -587,6 +587,12 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale) {
           TORCH_CHECK(false,                                                   \
                       "Unsupported input type of kv cache: ", SRC_DTYPE);      \
         }                                                                      \
+      } else if (KV_DTYPE == "fp4" || KV_DTYPE == "fp4_e2m1") {                \
+        TORCH_CHECK(false,                                                      \
+            "fp4 / fp4_e2m1 kv cache is only supported on AMD GPUs (ROCm). "   \
+            "This vLLM build was compiled for CUDA. To use fp4 kv cache, "     \
+            "rebuild vLLM with HIP/ROCm (e.g. install PyTorch ROCm and "        \
+            "build vLLM from source, or use a ROCm wheel).");                   \
       } else {                                                                 \
         TORCH_CHECK(false, "Unsupported data type of kv cache: ", KV_DTYPE);   \
       }                                                                        \

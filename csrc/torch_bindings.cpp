@@ -6,6 +6,38 @@
 #include <torch/library.h>
 #include <torch/version.h>
 
+// Weak stubs: provide fallback symbols so the shared library can load
+// even if cache_kernels.cu was not compiled with MXFP4/NVFP4 support.
+// When the real implementation is linked, the linker uses the strong symbol
+// from cache_kernels.o instead of these weak stubs.
+#ifdef __GNUC__
+__attribute__((weak))
+#endif
+void reshape_and_cache_flash_fp4_mxfp4(
+    torch::Tensor& key, torch::Tensor& value,
+    torch::Tensor& key_cache, torch::Tensor& value_cache,
+    torch::Tensor& k_e8m0_scales, torch::Tensor& v_e8m0_scales,
+    torch::Tensor& slot_mapping,
+    const std::string& kv_cache_dtype) {
+  TORCH_CHECK(false,
+              "reshape_and_cache_flash_fp4_mxfp4 is not compiled. "
+              "Please rebuild vLLM with the updated cache_kernels.cu.");
+}
+
+#ifdef __GNUC__
+__attribute__((weak))
+#endif
+void reshape_and_cache_flash_fp4_nvfp4(
+    torch::Tensor& key, torch::Tensor& value,
+    torch::Tensor& key_cache, torch::Tensor& value_cache,
+    torch::Tensor& k_fp8_scales, torch::Tensor& v_fp8_scales,
+    torch::Tensor& slot_mapping,
+    const std::string& kv_cache_dtype) {
+  TORCH_CHECK(false,
+              "reshape_and_cache_flash_fp4_nvfp4 is not compiled. "
+              "Please rebuild vLLM with the updated cache_kernels.cu.");
+}
+
 // Note on op signatures:
 // The X_meta signatures are for the meta functions corresponding to op X.
 // They must be kept in sync with the signature for X. Generally, only
@@ -701,7 +733,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 #endif
 }
 
+namespace {
+bool supports_fp4_kv_cache() {
+#ifdef USE_ROCM
+  return true;
+#else
+  return false;
+#endif
+}
+}  // namespace
+
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
+  // Whether this build supports fp4/fp4_e2m1 kv cache (ROCm only).
+  cache_ops.def("supports_fp4_kv_cache() -> bool");
+  cache_ops.impl("supports_fp4_kv_cache", torch::kCPU, &supports_fp4_kv_cache);
+
   // Cache ops
   // Swap in (out) the cache blocks from src to dst.
   cache_ops.def(
@@ -727,6 +773,50 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                        Tensor k_scale, Tensor v_scale) -> ()");
   cache_ops.impl("reshape_and_cache_flash", torch::kCUDA,
                  &reshape_and_cache_flash);
+
+  // Reshape the key and value tensors with per-token FP4 quantization.
+  cache_ops.def(
+      "reshape_and_cache_flash_with_pertoken_quant("
+      "    Tensor key, Tensor value,"
+      "    Tensor! key_cache, Tensor! value_cache,"
+      "    Tensor! k_dequant_scales, Tensor! v_dequant_scales,"
+      "    Tensor slot_mapping,"
+      "    str kv_cache_dtype) -> ()");
+  cache_ops.impl("reshape_and_cache_flash_with_pertoken_quant", torch::kCUDA,
+                 &reshape_and_cache_flash_with_pertoken_quant);
+
+  cache_ops.def(
+      "reshape_and_cache_flash_fp4_per_channel_k_per_token_v("
+      "    Tensor key, Tensor value,"
+      "    Tensor! key_cache, Tensor! value_cache,"
+      "    Tensor k_channel_scales, Tensor! v_dequant_scales,"
+      "    Tensor slot_mapping,"
+      "    str kv_cache_dtype) -> ()");
+  cache_ops.impl("reshape_and_cache_flash_fp4_per_channel_k_per_token_v",
+                 torch::kCUDA,
+                 &reshape_and_cache_flash_fp4_per_channel_k_per_token_v);
+
+  cache_ops.def(
+      "reshape_and_cache_flash_fp4_mxfp4("
+      "    Tensor key, Tensor value,"
+      "    Tensor! key_cache, Tensor! value_cache,"
+      "    Tensor! k_e8m0_scales, Tensor! v_e8m0_scales,"
+      "    Tensor slot_mapping,"
+      "    str kv_cache_dtype) -> ()");
+  cache_ops.impl("reshape_and_cache_flash_fp4_mxfp4",
+                 torch::kCUDA,
+                 &reshape_and_cache_flash_fp4_mxfp4);
+
+  cache_ops.def(
+      "reshape_and_cache_flash_fp4_nvfp4("
+      "    Tensor key, Tensor value,"
+      "    Tensor! key_cache, Tensor! value_cache,"
+      "    Tensor! k_fp8_scales, Tensor! v_fp8_scales,"
+      "    Tensor slot_mapping,"
+      "    str kv_cache_dtype) -> ()");
+  cache_ops.impl("reshape_and_cache_flash_fp4_nvfp4",
+                 torch::kCUDA,
+                 &reshape_and_cache_flash_fp4_nvfp4);
 
   // Concat kv_c and k_pe and cache them.
   cache_ops.def(

@@ -57,55 +57,90 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         # No need to process kv scales after loading if we are going to
         # calculate them on the fly.
         if layer.kv_cache_dtype != "auto" and not layer.calculate_kv_scales:
-            if layer.k_scale > 0.0 and layer.v_scale > 0.0:
-                # We prefer to use separate k_scale and v_scale if present
-                k_scale = layer.k_scale.to("cpu").tolist()
-                v_scale = layer.v_scale.to("cpu").tolist()
-                if current_platform.is_fp8_fnuz():
-                    k_scale *= 2
-                    v_scale *= 2
-            elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
-                # If no scales were loaded (both scales are invalid negative
-                # values), use the default value of 1.0
+            if layer.kv_cache_dtype.startswith("fp4"):
+                if not current_platform.is_rocm():
+                    raise ValueError(
+                        "FP4 KV cache with per-token quantization is only "
+                        "supported on AMD GPUs (ROCm)."
+                    )
+                # FP4 uses dynamic quantization scales computed at cache write
+                # time.  Default: per-block-32 for both K and V.
+                # With VLLM_FP4_PER_CHANNEL_K=1: K uses per-channel scales
+                # (one per head-dim element, computed from first prefill) and
+                # V uses per-token scales (one per token per head).
+                # With VLLM_FP4_MXFP4=1: uses OCP MX MXFP4 block scaling
+                # with E8M0 (power-of-2) scales stored as uint8.  Both K
+                # and V use per-block-32 with 4× smaller scale storage.
+                # With VLLM_FP4_NVFP4=1: NVFP4-style block scaling using
+                # FP8 E4M3 FNUZ scales (1 byte each, same storage as E8M0
+                # but with 3 mantissa bits of precision).  Inspired by
+                # NVIDIA NVFP4, this provides ~5% higher accuracy than
+                # MXFP4 E8M0 on typical LLM benchmarks due to non-power-of-2
+                # scale precision.
                 k_scale = 1.0
                 v_scale = 1.0
+                layer._k_scale.copy_(k_scale)
+                layer._v_scale.copy_(v_scale)
+                layer._k_scale_float = k_scale
+                layer._v_scale_float = v_scale
+                layer.fp4_per_token_quant = True
             else:
-                # If we find a single kv_scale in the checkpoint, we remap
-                # kv_scale to k_scale during weight loading, and duplicate
-                # k_scale to v_scale here
-                assert layer.k_scale > 0.0
-                scale_to_duplicate = max(layer.k_scale, layer.v_scale)
-                k_scale = scale_to_duplicate.to("cpu").tolist()
-                v_scale = scale_to_duplicate.to("cpu").tolist()
-                if current_platform.is_fp8_fnuz():
-                    k_scale *= 2
-                    v_scale *= 2
+                if layer.k_scale > 0.0 and layer.v_scale > 0.0:
+                    # We prefer to use separate k_scale and v_scale if present
+                    k_scale = layer.k_scale.to("cpu").tolist()
+                    v_scale = layer.v_scale.to("cpu").tolist()
+                    if current_platform.is_fp8_fnuz():
+                        k_scale *= 2
+                        v_scale *= 2
+                elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
+                    # If no scales were loaded (both scales are invalid
+                    # negative values), use the default value of 1.0
+                    k_scale = 1.0
+                    v_scale = 1.0
+                else:
+                    # If we find a single kv_scale in the checkpoint, we
+                    # remap kv_scale to k_scale during weight loading, and
+                    # duplicate k_scale to v_scale here
+                    assert layer.k_scale > 0.0
+                    scale_to_duplicate = max(layer.k_scale, layer.v_scale)
+                    k_scale = scale_to_duplicate.to("cpu").tolist()
+                    v_scale = scale_to_duplicate.to("cpu").tolist()
+                    if current_platform.is_fp8_fnuz():
+                        k_scale *= 2
+                        v_scale *= 2
 
-            if not isinstance(k_scale, float) or not isinstance(v_scale, float):
-                raise ValueError(
-                    "Only support per-tensor scaling factor for fp8 KV cache"
-                )
+                if not isinstance(k_scale, float) or not isinstance(
+                    v_scale, float
+                ):
+                    raise ValueError(
+                        "Only support per-tensor scaling factor "
+                        "for fp8 KV cache"
+                    )
 
-            if layer.q_scale < 0.0:
-                logger.warning_once(
-                    "Checkpoint does not provide a q scaling factor. "
-                    "Setting it to k_scale. This only matters for "
-                    "FP8 Attention backends (flash-attn or flashinfer)."
-                )
-                layer._q_scale.copy_(k_scale)
-                layer._q_scale_float = k_scale
+                if layer.q_scale < 0.0:
+                    logger.warning_once(
+                        "Checkpoint does not provide a q scaling factor. "
+                        "Setting it to k_scale. This only matters for "
+                        "FP8 Attention backends (flash-attn or flashinfer)."
+                    )
+                    layer._q_scale.copy_(k_scale)
+                    layer._q_scale_float = k_scale
 
-            # These are used in the final Attention.forward()
-            layer._k_scale.copy_(k_scale)
-            layer._v_scale.copy_(v_scale)
-            layer._k_scale_float = k_scale
-            layer._v_scale_float = v_scale
-            if k_scale == 1.0 and v_scale == 1.0 and "e5m2" not in layer.kv_cache_dtype:
-                logger.warning_once(
-                    "Using KV cache scaling factor 1.0 for fp8_e4m3. "
-                    "If this is unintended, verify that k/v_scale "
-                    "scaling factors are properly set in the checkpoint."
-                )
+                # These are used in the final Attention.forward()
+                layer._k_scale.copy_(k_scale)
+                layer._v_scale.copy_(v_scale)
+                layer._k_scale_float = k_scale
+                layer._v_scale_float = v_scale
+                if (
+                    k_scale == 1.0
+                    and v_scale == 1.0
+                    and "e5m2" not in layer.kv_cache_dtype
+                ):
+                    logger.warning_once(
+                        "Using KV cache scaling factor 1.0 for fp8_e4m3. "
+                        "If this is unintended, verify that k/v_scale "
+                        "scaling factors are properly set in the checkpoint."
+                    )
 
         if layer.q_scale > 0.0:
             q_scale = layer.q_scale

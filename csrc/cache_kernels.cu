@@ -129,8 +129,6 @@ struct CopyWithScaleOp {
   __device__ __forceinline__ void operator()(OutT& dst, const InT src) const {
     if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
       dst = static_cast<OutT>(src);
-    } else if constexpr (kv_dt == Fp8KVCacheDataType::kFp4E2M1) { // deal with FP4
-        dst = fp4::scaled_vec_conversion<Tout, Tin>(src, scale);
     } else {
       dst = fp8::scaled_convert<OutT, InT, kv_dt>(src, scale);
     }
@@ -207,7 +205,8 @@ __global__ void reshape_and_cache_flash_kernel(
     const int64_t block_stride, const int64_t page_stride,
     const int64_t head_stride, const int64_t key_stride,
     const int64_t value_stride, const int num_heads, const int head_size,
-    const int block_size, const float* k_scale, const float* v_scale) {
+    const int block_size, const int num_blocks, const float* k_scale,
+    const float* v_scale) {
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
   // NOTE: slot_idx can be -1 if the token is padded
@@ -216,6 +215,11 @@ __global__ void reshape_and_cache_flash_kernel(
   }
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
+  // Bounds check to avoid GPU memory access fault from invalid slot_mapping
+  // (e.g. during CUDA graph capture/replay or race).
+  if (block_idx >= num_blocks || block_offset >= block_size) {
+    return;
+  }
   const int n_elems = num_heads * head_size;
 
   // pointers to the beginning of the source row for this token.
@@ -236,6 +240,42 @@ __global__ void reshape_and_cache_flash_kernel(
   constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
   CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
   CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+
+#ifdef USE_ROCM
+  // FP4 uses 2 values per byte (packed); write n_elems/2 bytes.
+  // Caller must ensure head_size is even and cache last dim is head_size/2.
+  if constexpr (kv_dt == Fp8KVCacheDataType::kFp4E2M1) {
+    if (head_size & 1) {
+      return;  // Should not happen if C++ validation is used.
+    }
+    const int half_head = head_size / 2;
+    const int n_elems_packed = num_heads * half_head;
+    for (int i = threadIdx.x; i < n_elems_packed; i += blockDim.x) {
+      const int head_idx = i / half_head;
+      const int j = i % half_head;
+      const int64_t dst_off = is_contiguous_heads
+          ? static_cast<int64_t>(i)
+          : (static_cast<int64_t>(head_idx) * head_stride + j);
+      if (dst_off >= page_stride) {
+        continue;  // Guard against out-of-bounds write (avoid GPU memory fault)
+      }
+      const int src_base = 2 * i;
+      uint8_t k_lo = fp8::scaled_convert<uint8_t, scalar_t, kv_dt>(
+          key_src[src_base], k_scale_val);
+      uint8_t k_hi = fp8::scaled_convert<uint8_t, scalar_t, kv_dt>(
+          key_src[src_base + 1], k_scale_val);
+      key_dst[dst_off] = static_cast<cache_t>((k_lo & 0xF) | ((k_hi & 0xF) << 4));
+      uint8_t v_lo = fp8::scaled_convert<uint8_t, scalar_t, kv_dt>(
+          value_src[src_base], v_scale_val);
+      uint8_t v_hi = fp8::scaled_convert<uint8_t, scalar_t, kv_dt>(
+          value_src[src_base + 1], v_scale_val);
+      value_dst[dst_off] =
+          static_cast<cache_t>((v_lo & 0xF) | ((v_hi & 0xF) << 4));
+    }
+    return;
+  }
+#endif
+
   if (is_contiguous_heads) {
     // NHD layout
     // kv cache: [num_blocks, block_size, num_heads, head_size]
@@ -609,7 +649,8 @@ void reshape_and_cache(
           reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),             \
           slot_mapping.data_ptr<int64_t>(), block_stride, page_stride,    \
           head_stride, key_stride, value_stride, num_heads, head_size,    \
-          block_size, reinterpret_cast<const float*>(k_scale.data_ptr()), \
+          block_size, num_blocks,                                         \
+          reinterpret_cast<const float*>(k_scale.data_ptr()),              \
           reinterpret_cast<const float*>(v_scale.data_ptr()));
 
 void reshape_and_cache_flash(
@@ -635,6 +676,24 @@ void reshape_and_cache_flash(
   int num_heads = key.size(1);
   int head_size = key.size(2);
   int block_size = key_cache.size(1);
+  int num_blocks = key_cache.size(0);
+
+  // FP4 uses packed layout: cache last dim is head_size/2; validate to avoid
+  // out-of-bounds writes and GPU memory access faults (e.g. "Memory access
+  // fault by GPU" when aiter or other consumers read the cache).
+  if (kv_cache_dtype == "fp4" || kv_cache_dtype == "fp4_e2m1") {
+    TORCH_CHECK(key_cache.dim() == 4,
+                "FP4 KV cache key_cache must be 4D [num_blocks, block_size, "
+                "num_heads, head_size/2]");
+    TORCH_CHECK(value_cache.dim() == 4 && value_cache.sizes() == key_cache.sizes(),
+                "FP4 KV cache value_cache must have same shape as key_cache");
+    TORCH_CHECK(head_size % 2 == 0,
+                "FP4 KV cache requires even head_size, got ", head_size);
+    int cache_head_dim = key_cache.size(3);
+    TORCH_CHECK(cache_head_dim == head_size / 2,
+                "FP4 KV cache last dim must be head_size/2: expected ",
+                head_size / 2, ", got ", cache_head_dim);
+  }
 
   int64_t key_stride = key.stride(0);
   int64_t value_stride = value.stride(0);
@@ -650,6 +709,1756 @@ void reshape_and_cache_flash(
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE_FLASH);
+}
+
+#ifdef USE_ROCM
+namespace vllm {
+
+// ---------------------------------------------------------------------------
+// FP4 outlier-clipping tunable.
+//
+// When FP4_OUTLIER_CLIP_SIGMA > 0 the quantisation scale is computed as
+//   effective_max = min(absmax, rms * FP4_OUTLIER_CLIP_SIGMA)
+//   scale         = effective_max / 6.0
+// instead of the default  scale = absmax / 6.0.
+//
+// This trades pinpoint accuracy for the very few outlier elements
+// (those beyond CLIP_SIGMA standard-deviations) in exchange for tighter
+// quantisation steps — and therefore lower MSE — for the vast majority
+// of values.  Typical recommended range: 4.0 – 6.0.
+//
+// Set to 0 (the default) to disable clipping and keep the original
+// absmax behaviour.
+//
+// NOTE: FP4_OUTLIER_CLIP_SIGMA must be an integer constant (not 0.0f)
+// because it is used in preprocessor #if expressions, which only
+// support integer arithmetic.  The float sigma value is derived from
+// this integer at runtime via static_cast<float>.
+// ---------------------------------------------------------------------------
+#ifndef FP4_OUTLIER_CLIP_SIGMA
+#define FP4_OUTLIER_CLIP_SIGMA 0
+#endif
+
+// ---------------------------------------------------------------------------
+// FP4 MSE-optimal scale refinement.
+//
+// When FP4_MSE_REFINE_ITERS > 0, after the initial absmax-based
+// quantization, the scale is refined using the closed-form MSE-optimal
+// formula  s* = sum(x_i * q_i) / sum(q_i^2)   where q_i is the E2M1
+// quantization level assigned to x_i.  Each refinement re-quantizes
+// with the updated scale and re-computes s*.  Typical: 1 iteration is
+// sufficient for near-optimal MSE.
+//
+// Set to 0 (the default) to disable refinement and keep the absmax scale.
+// ---------------------------------------------------------------------------
+#ifndef FP4_MSE_REFINE_ITERS
+#define FP4_MSE_REFINE_ITERS 0
+#endif
+
+// ---------------------------------------------------------------------------
+// Per-block-specific accuracy tuning.
+//
+// These control outlier clipping and MSE refinement for per-block-32 paths
+// independently from the per-token flags.  Per-block quantization benefits
+// MORE from these optimizations because each block has only 32 elements:
+// a single outlier can waste 1/32 of the dynamic range vs 1/128 for
+// per-token.  Defaults are enabled for better out-of-the-box accuracy.
+//
+// FP4_PER_BLOCK_MSE_REFINE_ITERS: MSE-optimal scale refinement iterations
+//   applied only in the per-block path (num_quant_blocks > 1).
+//   Default: 1  (one iteration is sufficient for near-optimal MSE).
+//   Overridden by FP4_MSE_REFINE_ITERS if that is nonzero.
+//
+// FP4_PER_BLOCK_CLIP_SIGMA: outlier clip sigma for per-block paths.
+//   Default: 0 (disabled).  Typical range: 4 – 6.
+//   Overridden by FP4_OUTLIER_CLIP_SIGMA if that is nonzero.
+// ---------------------------------------------------------------------------
+#ifndef FP4_PER_BLOCK_MSE_REFINE_ITERS
+#define FP4_PER_BLOCK_MSE_REFINE_ITERS 1
+#endif
+#ifndef FP4_PER_BLOCK_CLIP_SIGMA
+#define FP4_PER_BLOCK_CLIP_SIGMA 0
+#endif
+
+// Effective per-block flags: global override takes priority
+#if FP4_OUTLIER_CLIP_SIGMA > 0
+#define FP4_BLOCK_CLIP_EFF FP4_OUTLIER_CLIP_SIGMA
+#elif FP4_PER_BLOCK_CLIP_SIGMA > 0
+#define FP4_BLOCK_CLIP_EFF FP4_PER_BLOCK_CLIP_SIGMA
+#else
+#define FP4_BLOCK_CLIP_EFF 0
+#endif
+
+#if FP4_MSE_REFINE_ITERS > 0
+#define FP4_BLOCK_MSE_EFF FP4_MSE_REFINE_ITERS
+#elif FP4_PER_BLOCK_MSE_REFINE_ITERS > 0
+#define FP4_BLOCK_MSE_EFF FP4_PER_BLOCK_MSE_REFINE_ITERS
+#else
+#define FP4_BLOCK_MSE_EFF 0
+#endif
+
+// ---------------------------------------------------------------------------
+// Per-channel-K kernel V-path specific compile-time flags.
+//
+// FP4_PCK_V_MSE_REFINE_ITERS: MSE-optimal scale refinement for V per-token
+//   in the per-channel-K kernel.  Default: 1 (enabled).
+//
+// FP4_PCK_V_CLIP_SIGMA: outlier clipping sigma for V per-token in the
+//   per-channel-K kernel.  Default: 0 (disabled).
+//
+// Global flags (FP4_MSE_REFINE_ITERS / FP4_OUTLIER_CLIP_SIGMA) override
+// these if set to a nonzero value.
+// ---------------------------------------------------------------------------
+#ifndef FP4_PCK_V_MSE_REFINE_ITERS
+#define FP4_PCK_V_MSE_REFINE_ITERS 1
+#endif
+#ifndef FP4_PCK_V_CLIP_SIGMA
+#define FP4_PCK_V_CLIP_SIGMA 0
+#endif
+
+#if FP4_MSE_REFINE_ITERS > 0
+#define FP4_PCK_V_MSE_EFF FP4_MSE_REFINE_ITERS
+#elif FP4_PCK_V_MSE_REFINE_ITERS > 0
+#define FP4_PCK_V_MSE_EFF FP4_PCK_V_MSE_REFINE_ITERS
+#else
+#define FP4_PCK_V_MSE_EFF 0
+#endif
+
+#if FP4_OUTLIER_CLIP_SIGMA > 0
+#define FP4_PCK_V_CLIP_EFF FP4_OUTLIER_CLIP_SIGMA
+#elif FP4_PCK_V_CLIP_SIGMA > 0
+#define FP4_PCK_V_CLIP_EFF FP4_PCK_V_CLIP_SIGMA
+#else
+#define FP4_PCK_V_CLIP_EFF 0
+#endif
+
+// ---------------------------------------------------------------------------
+// In-kernel Walsh-Hadamard Transform with QuIP#-style random sign flipping.
+//
+// When FP4_USE_IN_KERNEL_WHT is 1, the kernel applies a randomized
+// Hadamard rotation to K/V *in float32* before computing absmax and
+// quantizing.  This eliminates the BF16 roundtrip that occurs when WHT
+// is performed in Python, giving slightly better precision.
+//
+// The random ±1 signs use Knuth's multiplicative hash on the dimension
+// index, matching the Python _get_fp4_hadamard_signs() function exactly.
+//
+// When this is enabled, the Python-side cache write should NOT apply
+// WHT (set VLLM_FP4_IN_KERNEL_WHT=1 alongside VLLM_FP4_HADAMARD=1).
+// The Python-side WHT is still used for Q rotation at decode time and
+// K/V inverse-rotation in the extend dequant path.
+// ---------------------------------------------------------------------------
+#ifndef FP4_USE_IN_KERNEL_WHT
+#define FP4_USE_IN_KERNEL_WHT 0
+#endif
+
+#if FP4_USE_IN_KERNEL_WHT
+__inline__ __device__ float fp4_wht_sign(int dim_idx) {
+  unsigned int hash = static_cast<unsigned int>(dim_idx) * 2654435761u;
+  return (hash & 0x80000000u) ? -1.0f : 1.0f;
+}
+#endif
+
+// FP4 E2M1 per-token quantization nibble encoder matching aiter's standard
+// E2M1 encoding used by its paged attention kernel.  The nibble layout is
+// sign(bit3) | magnitude(bits 2:0) mapping to
+// {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}.
+__inline__ __device__ uint8_t fp4_e2m1_quantize_nibble(float x) {
+  uint8_t sign = (x < 0.0f) ? 8 : 0;
+  float a = fabsf(x);
+  uint8_t mag;
+  if      (a < 0.25f) mag = 0;
+  else if (a < 0.75f) mag = 1;
+  else if (a < 1.25f) mag = 2;
+  else if (a < 1.75f) mag = 3;
+  else if (a < 2.5f)  mag = 4;
+  else if (a < 3.5f)  mag = 5;
+  else if (a < 5.0f)  mag = 6;
+  else                mag = 7;
+  return sign | mag;
+}
+
+__constant__ float fp4_e2m1_lut[8] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f
+};
+
+__inline__ __device__ float fp4_e2m1_dequant_value(uint8_t nibble) {
+  float mag = fp4_e2m1_lut[nibble & 0x7];
+  return (nibble & 0x8) ? -mag : mag;
+}
+
+// ---------------------------------------------------------------------------
+// E8M0 (OCP MX shared-exponent) conversion helpers for MXFP4 block scaling.
+//
+// E8M0 format: 8-bit unsigned exponent with bias 127.
+//   value = 2^(e8m0 - 127)
+//   e8m0 = round(log2(value)) + 127
+// Range: 2^(-127) to 2^(127).  e8m0=255 is NaN (mapped to 0 for safety).
+// ---------------------------------------------------------------------------
+__inline__ __device__ uint8_t float_to_e8m0(float x) {
+  if (x <= 0.0f) return 0;
+  float log2_x = log2f(x);
+  int biased = static_cast<int>(roundf(log2_x)) + 127;
+  if (biased < 0) biased = 0;
+  if (biased > 254) biased = 254;
+  return static_cast<uint8_t>(biased);
+}
+
+__inline__ __device__ float e8m0_to_float(uint8_t e8m0) {
+  if (e8m0 == 255) return 0.0f;
+  return exp2f(static_cast<float>(e8m0) - 127.0f);
+}
+
+// ---------------------------------------------------------------------------
+// FP8 E4M3 (FNUZ, AMD-style) conversion helpers for NVFP4 block scaling.
+//
+// E4M3 FNUZ format: 1 sign + 4 exponent + 3 mantissa bits, bias = 8.
+//   Normal:     value = (-1)^s * 2^(E-8) * (1 + M/8)   for E > 0
+//   Subnormal:  value = (-1)^s * 2^(-7)  * (M/8)        for E = 0
+//   Zero:       0x00 (positive zero), 0x80 (negative zero / NaN in FNUZ)
+//   Max value:  240.0  (E=15, M=7 → 2^7 * 1.875 = 240)
+//
+// For quantization scales we only need positive values.
+// Compared to E8M0, E4M3 has 3 mantissa bits of precision within each
+// binade, reducing round-trip quantization error by ~5% on typical LLM
+// benchmarks (per NVIDIA NVFP4 findings).
+// ---------------------------------------------------------------------------
+__inline__ __device__ uint8_t float_to_fp8_e4m3(float x) {
+  if (x <= 0.0f) return 0;
+  constexpr float FP8_E4M3_MAX = 240.0f;
+  x = fminf(x, FP8_E4M3_MAX);
+
+  float log2_x = log2f(x);
+  int exp_unbiased = static_cast<int>(floorf(log2_x));
+  int biased_exp = exp_unbiased + 8;
+
+  if (biased_exp <= 0) {
+    float sub_val = x / exp2f(-7.0f);
+    int mantissa = static_cast<int>(roundf(sub_val * 8.0f));
+    mantissa = min(max(mantissa, 0), 7);
+    return static_cast<uint8_t>(mantissa);
+  }
+  if (biased_exp >= 16) {
+    return 0x7F;  // max positive = 240.0
+  }
+
+  float power = exp2f(static_cast<float>(exp_unbiased));
+  float frac = x / power - 1.0f;
+  int mantissa = static_cast<int>(roundf(frac * 8.0f));
+  if (mantissa >= 8) {
+    mantissa = 0;
+    biased_exp += 1;
+    if (biased_exp >= 16) return 0x7F;
+  }
+  return static_cast<uint8_t>((biased_exp << 3) | (mantissa & 0x7));
+}
+
+__inline__ __device__ float fp8_e4m3_to_float(uint8_t x) {
+  if (x == 0) return 0.0f;
+  int exp_bits = (x >> 3) & 0xF;
+  int mantissa = x & 0x7;
+  if (exp_bits == 0) {
+    return exp2f(-7.0f) * (static_cast<float>(mantissa) / 8.0f);
+  }
+  return exp2f(static_cast<float>(exp_bits - 8))
+         * (1.0f + static_cast<float>(mantissa) / 8.0f);
+}
+
+// Per-token / per-block FP4 E2M1 quantization kernel for KV cache (NHD layout).
+//
+// Grid : (num_tokens, num_heads)  – one block per (token, head) pair.
+// Block: 64 threads (one wavefront on MI300X).
+//
+// Both K and V support per-block quantization: each group of
+// FP4_QUANT_BLOCK_SIZE (32) head elements gets its own scale.
+// When num_k_quant_blocks == 1 or num_v_quant_blocks == 1 the kernel
+// falls back to per-token scaling for the respective tensor.
+//
+// Both per-block and per-token paths support the optional accuracy
+// optimizations controlled by the compile-time flags:
+//   - FP4_OUTLIER_CLIP_SIGMA: clamp scale via per-block/per-token RMS
+//   - FP4_MSE_REFINE_ITERS:  MSE-optimal scale refinement iterations
+// Per-block paths use partial warp reductions (32 lanes) to keep each
+// block's statistics independent.
+template <typename scalar_t>
+__global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
+    const scalar_t* __restrict__ key,         // [num_tokens, num_heads, head_size]
+    const scalar_t* __restrict__ value,       // [num_tokens, num_heads, head_size]
+    uint8_t* __restrict__ key_cache,          // [num_blocks, block_size, num_heads, head_size/2]
+    uint8_t* __restrict__ value_cache,        // [num_blocks, block_size, num_heads, head_size/2]
+    float* __restrict__ k_dequant_scales,     // [num_heads * num_k_quant_blocks, max_kv_tokens]
+    float* __restrict__ v_dequant_scales,     // [num_heads * num_v_quant_blocks, max_kv_tokens]
+    const int64_t* __restrict__ slot_mapping, // [num_tokens]
+    const int64_t key_stride,
+    const int64_t value_stride,
+    const int head_size,
+    const int block_size,
+    const int num_blocks,
+    const int64_t block_stride,
+    const int64_t page_stride,
+    const int64_t head_stride,
+    const int64_t k_scale_stride_h,
+    const int64_t v_scale_stride_h,
+    const int num_k_quant_blocks,
+    const int num_v_quant_blocks) {
+
+  constexpr float FP4_MAX = 6.0f;
+  constexpr int LOCAL_DIM_ELEMS = 8;  // supports head_size up to 64*8 = 512
+
+  const int64_t token_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int lane_id = threadIdx.x;
+
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) return;
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  if (block_idx >= num_blocks || block_offset >= block_size) return;
+
+  const int half_head = head_size / 2;
+
+  const scalar_t* k_src =
+      key + token_idx * key_stride + head_idx * head_size;
+  const scalar_t* v_src =
+      value + token_idx * value_stride + head_idx * head_size;
+
+  // --- Phase A: load K/V elements into registers ----------------------------
+  float k_local[LOCAL_DIM_ELEMS];
+  float v_local[LOCAL_DIM_ELEMS];
+
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      k_local[i] = static_cast<float>(k_src[d]);
+      v_local[i] = static_cast<float>(v_src[d]);
+    } else {
+      k_local[i] = 0.0f;
+      v_local[i] = 0.0f;
+    }
+  }
+
+#if FP4_USE_IN_KERNEL_WHT
+  // --- Phase B: in-kernel randomized Hadamard rotation ----------------------
+  // Apply QuIP#-style random signs (D matrix)
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      float sign = fp4_wht_sign(d);
+      k_local[i] *= sign;
+      v_local[i] *= sign;
+    }
+  }
+
+  // Fast Walsh-Hadamard Transform via warp shuffles
+  // Inter-lane butterflies (stages for h = 1, 2, 4, ..., warpSize/2)
+  for (int h = 1; h < warpSize && h < head_size; h *= 2) {
+    bool is_lower = (lane_id & h) == 0;
+#pragma unroll
+    for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+      if (lane_id + j * warpSize < head_size) {
+        float kp = __shfl_xor_sync(uint64_t(-1), k_local[j], h);
+        float vp = __shfl_xor_sync(uint64_t(-1), v_local[j], h);
+        k_local[j] = is_lower ? (k_local[j] + kp) : (kp - k_local[j]);
+        v_local[j] = is_lower ? (v_local[j] + vp) : (vp - v_local[j]);
+      }
+    }
+  }
+
+  // Intra-thread butterflies (stages for h = warpSize, 2·warpSize, ...)
+  for (int s = 1; s * warpSize < head_size; s *= 2) {
+#pragma unroll
+    for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+      int pj = j ^ s;
+      if (pj > j && pj < LOCAL_DIM_ELEMS
+          && lane_id + j  * warpSize < head_size
+          && lane_id + pj * warpSize < head_size) {
+        float ka = k_local[j] + k_local[pj];
+        float kb = k_local[j] - k_local[pj];
+        k_local[j]  = ka;
+        k_local[pj] = kb;
+        float va = v_local[j] + v_local[pj];
+        float vb = v_local[j] - v_local[pj];
+        v_local[j]  = va;
+        v_local[pj] = vb;
+      }
+    }
+  }
+
+  // Normalize
+  float wht_norm = rsqrtf(static_cast<float>(head_size));
+#pragma unroll
+  for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+    if (lane_id + j * warpSize < head_size) {
+      k_local[j] *= wht_norm;
+      v_local[j] *= wht_norm;
+    }
+  }
+#endif  // FP4_USE_IN_KERNEL_WHT
+
+  // --- Phase C: compute absmax on (possibly WHT'd) data ---------------------
+  // V uses per-token absmax (full warp reduction).
+  // K uses per-block-32 absmax when num_k_quant_blocks > 1: a partial warp
+  // reduction of FP4_QUANT_BLOCK_SIZE elements, giving one scale per block.
+  constexpr int FP4_QUANT_BLOCK_SIZE = 32;
+  constexpr int MAX_K_BLOCKS = LOCAL_DIM_ELEMS * 2;  // max blocks we can track
+
+  // --- V: per-block-32 or per-token absmax -----------------------------------
+  constexpr int MAX_V_BLOCKS = LOCAL_DIM_ELEMS * 2;
+  float v_block_scale[MAX_V_BLOCKS];
+  float v_block_scale_inv[MAX_V_BLOCKS];
+
+  if (num_v_quant_blocks > 1) {
+    // Per-block-32 V scales: absmax + outlier clipping + MSE refinement
+#pragma unroll
+    for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+      int d = lane_id + i * warpSize;
+      if (d < head_size) {
+        float v_abs = fabsf(v_local[i]);
+        for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2)
+          v_abs = fmaxf(v_abs,
+                        __shfl_xor_sync(uint64_t(-1), v_abs, off));
+#if FP4_BLOCK_CLIP_EFF > 0
+        float v_sq = v_local[i] * v_local[i];
+        for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2)
+          v_sq += __shfl_xor_sync(uint64_t(-1), v_sq, off);
+        float sq_lo = __shfl_sync(uint64_t(-1), v_sq, 0);
+        float sq_hi = __shfl_sync(uint64_t(-1), v_sq, FP4_QUANT_BLOCK_SIZE);
+#endif
+        float blk_lo = __shfl_sync(uint64_t(-1), v_abs, 0);
+        float blk_hi = __shfl_sync(uint64_t(-1), v_abs, FP4_QUANT_BLOCK_SIZE);
+        int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
+        int b1 = b0 + 1;
+        if (b0 < num_v_quant_blocks) {
+          float eff_max = blk_lo;
+#if FP4_BLOCK_CLIP_EFF > 0
+          float rms = sqrtf(sq_lo / static_cast<float>(FP4_QUANT_BLOCK_SIZE));
+          eff_max = fminf(blk_lo, rms * static_cast<float>(FP4_BLOCK_CLIP_EFF));
+#endif
+          v_block_scale[b0] = fmaxf(eff_max / FP4_MAX, 1e-12f);
+          v_block_scale_inv[b0] = 1.0f / v_block_scale[b0];
+        }
+        if (b1 < num_v_quant_blocks) {
+          float eff_max = blk_hi;
+#if FP4_BLOCK_CLIP_EFF > 0
+          float rms = sqrtf(sq_hi / static_cast<float>(FP4_QUANT_BLOCK_SIZE));
+          eff_max = fminf(blk_hi, rms * static_cast<float>(FP4_BLOCK_CLIP_EFF));
+#endif
+          v_block_scale[b1] = fmaxf(eff_max / FP4_MAX, 1e-12f);
+          v_block_scale_inv[b1] = 1.0f / v_block_scale[b1];
+        }
+      }
+    }
+#if FP4_BLOCK_MSE_EFF > 0
+    for (int refine = 0; refine < FP4_BLOCK_MSE_EFF; refine++) {
+#pragma unroll
+      for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+        int d = lane_id + i * warpSize;
+        if (d < head_size) {
+          int blk = d / FP4_QUANT_BLOCK_SIZE;
+          float s = v_block_scale[blk];
+          float vx = v_local[i];
+          float vq = fp4_e2m1_dequant_value(
+              fp4_e2m1_quantize_nibble(vx / s));
+          float xq_val = vx * vq;
+          float qq_val = vq * vq;
+          for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2) {
+            xq_val += __shfl_xor_sync(uint64_t(-1), xq_val, off);
+            qq_val += __shfl_xor_sync(uint64_t(-1), qq_val, off);
+          }
+          float xq_lo = __shfl_sync(uint64_t(-1), xq_val, 0);
+          float qq_lo = __shfl_sync(uint64_t(-1), qq_val, 0);
+          float xq_hi = __shfl_sync(uint64_t(-1), xq_val, FP4_QUANT_BLOCK_SIZE);
+          float qq_hi = __shfl_sync(uint64_t(-1), qq_val, FP4_QUANT_BLOCK_SIZE);
+          int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
+          int b1 = b0 + 1;
+          if (b0 < num_v_quant_blocks && qq_lo > 0.0f) {
+            v_block_scale[b0] = fmaxf(xq_lo / qq_lo, 1e-12f);
+            v_block_scale_inv[b0] = 1.0f / v_block_scale[b0];
+          }
+          if (b1 < num_v_quant_blocks && qq_hi > 0.0f) {
+            v_block_scale[b1] = fmaxf(xq_hi / qq_hi, 1e-12f);
+            v_block_scale_inv[b1] = 1.0f / v_block_scale[b1];
+          }
+        }
+      }
+    }
+#endif
+  } else {
+    // Per-token V scale (backward compatible)
+    float v_local_max = 0.0f;
+    float v_local_sum_sq = 0.0f;
+#pragma unroll
+    for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+      if (lane_id + i * warpSize < head_size) {
+        v_local_max = fmaxf(v_local_max, fabsf(v_local[i]));
+        v_local_sum_sq += v_local[i] * v_local[i];
+      }
+    }
+    float v_max = v_local_max;
+#pragma unroll
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+      v_max = fmaxf(v_max, __shfl_xor_sync(uint64_t(-1), v_max, offset));
+    float v_effective_max = v_max;
+#if FP4_OUTLIER_CLIP_SIGMA > 0
+    {
+      float v_sum_sq = v_local_sum_sq;
+#pragma unroll
+      for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        v_sum_sq += __shfl_xor_sync(uint64_t(-1), v_sum_sq, offset);
+      float v_rms = sqrtf(v_sum_sq / static_cast<float>(head_size));
+      float clip_sigma = static_cast<float>(FP4_OUTLIER_CLIP_SIGMA);
+      v_effective_max = fminf(v_max, v_rms * clip_sigma);
+    }
+#endif
+    float v_scale = fmaxf(v_effective_max / FP4_MAX, 1e-12f);
+#if FP4_MSE_REFINE_ITERS > 0
+    for (int refine = 0; refine < FP4_MSE_REFINE_ITERS; refine++) {
+      float v_xq = 0.0f, v_qq = 0.0f;
+#pragma unroll
+      for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+        int d = lane_id + i * warpSize;
+        if (d < head_size) {
+          float vx = v_local[i];
+          float vq = fp4_e2m1_dequant_value(
+              fp4_e2m1_quantize_nibble(vx / v_scale));
+          v_xq += vx * vq;
+          v_qq += vq * vq;
+        }
+      }
+#pragma unroll
+      for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        v_xq += __shfl_xor_sync(uint64_t(-1), v_xq, offset);
+        v_qq += __shfl_xor_sync(uint64_t(-1), v_qq, offset);
+      }
+      if (v_qq > 0.0f) v_scale = fmaxf(v_xq / v_qq, 1e-12f);
+    }
+#endif
+    v_block_scale[0] = v_scale;
+    v_block_scale_inv[0] = 1.0f / v_scale;
+  }
+
+  // --- K: per-block-32 absmax ------------------------------------------------
+  // Each k_local[i] covers warpSize elements.  With FP4_QUANT_BLOCK_SIZE=32
+  // and warpSize=64, each k_local[i] spans exactly 2 blocks.  A partial warp
+  // reduction with max offset = FP4_QUANT_BLOCK_SIZE/2 - 1 keeps each 32-lane
+  // half independent.
+  float k_block_scale[MAX_K_BLOCKS];
+  float k_block_scale_inv[MAX_K_BLOCKS];
+
+  if (num_k_quant_blocks > 1) {
+    // Per-block-32 K scales: absmax + outlier clipping + MSE refinement
+#pragma unroll
+    for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+      int d = lane_id + i * warpSize;
+      if (d < head_size) {
+        float k_abs = fabsf(k_local[i]);
+        for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2)
+          k_abs = fmaxf(k_abs,
+                        __shfl_xor_sync(uint64_t(-1), k_abs, off));
+#if FP4_BLOCK_CLIP_EFF > 0
+        float k_sq = k_local[i] * k_local[i];
+        for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2)
+          k_sq += __shfl_xor_sync(uint64_t(-1), k_sq, off);
+        float k_sq_lo = __shfl_sync(uint64_t(-1), k_sq, 0);
+        float k_sq_hi = __shfl_sync(uint64_t(-1), k_sq, FP4_QUANT_BLOCK_SIZE);
+#endif
+        float blk_lo = __shfl_sync(uint64_t(-1), k_abs, 0);
+        float blk_hi = __shfl_sync(uint64_t(-1), k_abs, FP4_QUANT_BLOCK_SIZE);
+        int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
+        int b1 = b0 + 1;
+        if (b0 < num_k_quant_blocks) {
+          float eff_max = blk_lo;
+#if FP4_BLOCK_CLIP_EFF > 0
+          float rms = sqrtf(k_sq_lo / static_cast<float>(FP4_QUANT_BLOCK_SIZE));
+          eff_max = fminf(blk_lo, rms * static_cast<float>(FP4_BLOCK_CLIP_EFF));
+#endif
+          k_block_scale[b0] = fmaxf(eff_max / FP4_MAX, 1e-12f);
+          k_block_scale_inv[b0] = 1.0f / k_block_scale[b0];
+        }
+        if (b1 < num_k_quant_blocks) {
+          float eff_max = blk_hi;
+#if FP4_BLOCK_CLIP_EFF > 0
+          float rms = sqrtf(k_sq_hi / static_cast<float>(FP4_QUANT_BLOCK_SIZE));
+          eff_max = fminf(blk_hi, rms * static_cast<float>(FP4_BLOCK_CLIP_EFF));
+#endif
+          k_block_scale[b1] = fmaxf(eff_max / FP4_MAX, 1e-12f);
+          k_block_scale_inv[b1] = 1.0f / k_block_scale[b1];
+        }
+      }
+    }
+#if FP4_BLOCK_MSE_EFF > 0
+    for (int refine = 0; refine < FP4_BLOCK_MSE_EFF; refine++) {
+#pragma unroll
+      for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+        int d = lane_id + i * warpSize;
+        if (d < head_size) {
+          int blk = d / FP4_QUANT_BLOCK_SIZE;
+          float s = k_block_scale[blk];
+          float kx = k_local[i];
+          float kq = fp4_e2m1_dequant_value(
+              fp4_e2m1_quantize_nibble(kx / s));
+          float xq_val = kx * kq;
+          float qq_val = kq * kq;
+          for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2) {
+            xq_val += __shfl_xor_sync(uint64_t(-1), xq_val, off);
+            qq_val += __shfl_xor_sync(uint64_t(-1), qq_val, off);
+          }
+          float xq_lo = __shfl_sync(uint64_t(-1), xq_val, 0);
+          float qq_lo = __shfl_sync(uint64_t(-1), qq_val, 0);
+          float xq_hi = __shfl_sync(uint64_t(-1), xq_val, FP4_QUANT_BLOCK_SIZE);
+          float qq_hi = __shfl_sync(uint64_t(-1), qq_val, FP4_QUANT_BLOCK_SIZE);
+          int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
+          int b1 = b0 + 1;
+          if (b0 < num_k_quant_blocks && qq_lo > 0.0f) {
+            k_block_scale[b0] = fmaxf(xq_lo / qq_lo, 1e-12f);
+            k_block_scale_inv[b0] = 1.0f / k_block_scale[b0];
+          }
+          if (b1 < num_k_quant_blocks && qq_hi > 0.0f) {
+            k_block_scale[b1] = fmaxf(xq_hi / qq_hi, 1e-12f);
+            k_block_scale_inv[b1] = 1.0f / k_block_scale[b1];
+          }
+        }
+      }
+    }
+#endif
+  } else {
+    // Per-token K scale (backward compatible: num_k_quant_blocks == 1)
+    float k_local_max = 0.0f;
+#pragma unroll
+    for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+      if (lane_id + i * warpSize < head_size)
+        k_local_max = fmaxf(k_local_max, fabsf(k_local[i]));
+    }
+    float k_max = k_local_max;
+#pragma unroll
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+      k_max = fmaxf(k_max,
+                    __shfl_xor_sync(uint64_t(-1), k_max, offset));
+    k_block_scale[0] = fmaxf(k_max / FP4_MAX, 1e-12f);
+    k_block_scale_inv[0] = 1.0f / k_block_scale[0];
+  }
+
+  // --- Store scales ----------------------------------------------------------
+  const int64_t k_blk_stride =
+      (num_k_quant_blocks > 1) ? (k_scale_stride_h / num_k_quant_blocks) : 0;
+  const int64_t v_blk_stride =
+      (num_v_quant_blocks > 1) ? (v_scale_stride_h / num_v_quant_blocks) : 0;
+  if (lane_id == 0) {
+    for (int b = 0; b < num_k_quant_blocks; b++) {
+      k_dequant_scales[head_idx * k_scale_stride_h
+                       + b * k_blk_stride + slot_idx] = k_block_scale[b];
+    }
+    for (int b = 0; b < num_v_quant_blocks; b++) {
+      v_dequant_scales[head_idx * v_scale_stride_h
+                       + b * v_blk_stride + slot_idx] = v_block_scale[b];
+    }
+  }
+
+  // --- Pass 2: quantize to FP4 E2M1, pack pairs, write to cache -------------
+#if FP4_USE_IN_KERNEL_WHT
+  // Scatter WHT'd float32 values to shared memory so each lane can read
+  // adjacent element-pairs for nibble packing without any BF16 roundtrip.
+  __shared__ float k_wht_smem[512];
+  __shared__ float v_wht_smem[512];
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      k_wht_smem[d] = k_local[i];
+      v_wht_smem[d] = v_local[i];
+    }
+  }
+  // Single-wavefront block → implicit barrier
+#endif
+
+  uint8_t* k_dst = key_cache + block_idx * block_stride
+                    + block_offset * page_stride
+                    + head_idx * head_stride;
+  uint8_t* v_dst = value_cache + block_idx * block_stride
+                    + block_offset * page_stride
+                    + head_idx * head_stride;
+
+  for (int j = lane_id; j < half_head; j += warpSize) {
+    int d0 = 2 * j;
+    int d1 = d0 + 1;
+
+    // K: per-block scale (both d0 and d1 are in the same block since
+    // d0 is even and FP4_QUANT_BLOCK_SIZE is a multiple of 2)
+    int kb = (num_k_quant_blocks > 1) ? (d0 / FP4_QUANT_BLOCK_SIZE) : 0;
+    float k_sinv = k_block_scale_inv[kb];
+
+#if FP4_USE_IN_KERNEL_WHT
+    float kf0 = k_wht_smem[d0] * k_sinv;
+    float kf1 = k_wht_smem[d1] * k_sinv;
+#else
+    float kf0 = static_cast<float>(k_src[d0]) * k_sinv;
+    float kf1 = static_cast<float>(k_src[d1]) * k_sinv;
+#endif
+    uint8_t kn0 = fp4_e2m1_quantize_nibble(kf0);
+    uint8_t kn1 = fp4_e2m1_quantize_nibble(kf1);
+    k_dst[j] = (kn0 & 0xF) | ((kn1 & 0xF) << 4);
+
+    // V: per-block scale (both d0 and d1 are in the same block)
+    int vb = (num_v_quant_blocks > 1) ? (d0 / FP4_QUANT_BLOCK_SIZE) : 0;
+    float v_sinv = v_block_scale_inv[vb];
+
+#if FP4_USE_IN_KERNEL_WHT
+    float vf0 = v_wht_smem[d0] * v_sinv;
+    float vf1 = v_wht_smem[d1] * v_sinv;
+#else
+    float vf0 = static_cast<float>(v_src[d0]) * v_sinv;
+    float vf1 = static_cast<float>(v_src[d1]) * v_sinv;
+#endif
+    uint8_t vn0 = fp4_e2m1_quantize_nibble(vf0);
+    uint8_t vn1 = fp4_e2m1_quantize_nibble(vf1);
+    v_dst[j] = (vn0 & 0xF) | ((vn1 & 0xF) << 4);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-channel-K / per-token-V FP4 E2M1 quantization kernel.
+//
+// K quantization uses externally-provided STATIC per-channel scales
+// (one scale per head-dimension element, shared across all tokens).
+// V quantization computes DYNAMIC per-token scales at write time
+// (one scale per token, shared across all head-dimension elements).
+//
+// During the PA decode, K channel scales are absorbed into Q before
+// the QK^T computation: Q_eff[d] = Q[d] * k_ch_scale[d], then
+// QK^T = Q_eff * K_fp4_dequant^T.  This eliminates per-token K scale
+// lookups entirely.
+//
+// Grid : (num_tokens, num_heads)  – one block per (token, head).
+// Block: 64 threads (one wavefront on MI300X).
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void reshape_and_cache_flash_fp4_perchannel_k_pertoken_v_kernel(
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    uint8_t* __restrict__ key_cache,
+    uint8_t* __restrict__ value_cache,
+    const float* __restrict__ k_channel_scales,  // [num_heads, head_size]
+    float* __restrict__ v_dequant_scales,         // [num_heads, max_kv_tokens]
+    const int64_t* __restrict__ slot_mapping,
+    const int64_t key_stride,
+    const int64_t value_stride,
+    const int head_size,
+    const int block_size,
+    const int num_blocks,
+    const int64_t block_stride,
+    const int64_t page_stride,
+    const int64_t head_stride,
+    const int64_t v_scale_stride_h) {
+
+  constexpr float FP4_MAX = 6.0f;
+  constexpr int LOCAL_DIM_ELEMS = 8;
+
+  const int64_t token_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int lane_id = threadIdx.x;
+
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) return;
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  if (block_idx >= num_blocks || block_offset >= block_size) return;
+
+  const int half_head = head_size / 2;
+
+  const scalar_t* k_src =
+      key + token_idx * key_stride + head_idx * head_size;
+  const scalar_t* v_src =
+      value + token_idx * value_stride + head_idx * head_size;
+  const float* k_ch_scale =
+      k_channel_scales + head_idx * head_size;
+
+  // --- Load V elements and compute per-token absmax -------------------------
+  float v_local[LOCAL_DIM_ELEMS];
+  float v_local_max = 0.0f;
+  float v_local_sum_sq = 0.0f;
+
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      v_local[i] = static_cast<float>(v_src[d]);
+      v_local_max = fmaxf(v_local_max, fabsf(v_local[i]));
+      v_local_sum_sq += v_local[i] * v_local[i];
+    } else {
+      v_local[i] = 0.0f;
+    }
+  }
+
+  float v_max = v_local_max;
+#pragma unroll
+  for (int offset = warpSize / 2; offset > 0; offset /= 2)
+    v_max = fmaxf(v_max, __shfl_xor_sync(uint64_t(-1), v_max, offset));
+
+  float v_effective_max = v_max;
+#if FP4_PCK_V_CLIP_EFF > 0
+  {
+    float v_sum_sq = v_local_sum_sq;
+#pragma unroll
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+      v_sum_sq += __shfl_xor_sync(uint64_t(-1), v_sum_sq, offset);
+    float v_rms = sqrtf(v_sum_sq / static_cast<float>(head_size));
+    float clip_sigma = static_cast<float>(FP4_PCK_V_CLIP_EFF);
+    v_effective_max = fminf(v_max, v_rms * clip_sigma);
+  }
+#endif
+
+  float v_scale = fmaxf(v_effective_max / FP4_MAX, 1e-12f);
+
+#if FP4_PCK_V_MSE_EFF > 0
+  for (int refine = 0; refine < FP4_PCK_V_MSE_EFF; refine++) {
+    float v_xq = 0.0f, v_qq = 0.0f;
+#pragma unroll
+    for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+      int d = lane_id + i * warpSize;
+      if (d < head_size) {
+        float vx = v_local[i];
+        float vq = fp4_e2m1_dequant_value(
+            fp4_e2m1_quantize_nibble(vx / v_scale));
+        v_xq += vx * vq;
+        v_qq += vq * vq;
+      }
+    }
+#pragma unroll
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+      v_xq += __shfl_xor_sync(uint64_t(-1), v_xq, offset);
+      v_qq += __shfl_xor_sync(uint64_t(-1), v_qq, offset);
+    }
+    if (v_qq > 0.0f) v_scale = fmaxf(v_xq / v_qq, 1e-12f);
+  }
+#endif
+
+  float v_scale_inv = 1.0f / v_scale;
+
+  if (lane_id == 0) {
+    v_dequant_scales[head_idx * v_scale_stride_h + slot_idx] = v_scale;
+  }
+
+  // --- Quantize and write K (per-channel) and V (per-token) -----------------
+  uint8_t* k_dst = key_cache + block_idx * block_stride
+                    + block_offset * page_stride
+                    + head_idx * head_stride;
+  uint8_t* v_dst = value_cache + block_idx * block_stride
+                    + block_offset * page_stride
+                    + head_idx * head_stride;
+
+  for (int j = lane_id; j < half_head; j += warpSize) {
+    int d0 = 2 * j;
+    int d1 = d0 + 1;
+
+    float kf0 = static_cast<float>(k_src[d0]) / k_ch_scale[d0];
+    float kf1 = static_cast<float>(k_src[d1]) / k_ch_scale[d1];
+    uint8_t kn0 = fp4_e2m1_quantize_nibble(kf0);
+    uint8_t kn1 = fp4_e2m1_quantize_nibble(kf1);
+    k_dst[j] = (kn0 & 0xF) | ((kn1 & 0xF) << 4);
+
+    float vf0 = static_cast<float>(v_src[d0]) * v_scale_inv;
+    float vf1 = static_cast<float>(v_src[d1]) * v_scale_inv;
+    uint8_t vn0 = fp4_e2m1_quantize_nibble(vf0);
+    uint8_t vn1 = fp4_e2m1_quantize_nibble(vf1);
+    v_dst[j] = (vn0 & 0xF) | ((vn1 & 0xF) << 4);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MXFP4 (OCP MX) block-scale FP4 E2M1 quantization kernel for KV cache.
+//
+// Uses per-block-32 quantization with E8M0 (power-of-2) scales stored as
+// uint8.  Each group of 32 head-dimension elements shares one E8M0 scale
+// byte.  This matches the OCP Microscaling FP4 specification:
+//   - Data: FP4 E2M1 (same as other FP4 kernels)
+//   - Scale: E8M0 — 8-bit exponent-only, value = 2^(e8m0 - 127)
+//   - Block size: 32
+//
+// Scale storage is 4× smaller than FP32 per-block scales (1 byte vs 4).
+// Power-of-2 scales enable efficient dequantization via exponent adjustment.
+//
+// Grid : (num_tokens, num_heads)  – one block per (token, head) pair.
+// Block: 64 threads (one wavefront on MI300X).
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void reshape_and_cache_flash_fp4_mxfp4_kernel(
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    uint8_t* __restrict__ key_cache,
+    uint8_t* __restrict__ value_cache,
+    uint8_t* __restrict__ k_e8m0_scales,
+    uint8_t* __restrict__ v_e8m0_scales,
+    const int64_t* __restrict__ slot_mapping,
+    const int64_t key_stride,
+    const int64_t value_stride,
+    const int head_size,
+    const int block_size,
+    const int num_blocks,
+    const int64_t block_stride,
+    const int64_t page_stride,
+    const int64_t head_stride,
+    const int64_t k_scale_stride_h,
+    const int64_t v_scale_stride_h,
+    const int num_k_quant_blocks,
+    const int num_v_quant_blocks) {
+
+  constexpr float FP4_MAX = 6.0f;
+  constexpr int LOCAL_DIM_ELEMS = 8;
+  constexpr int FP4_QUANT_BLOCK_SIZE = 32;
+  constexpr int MAX_BLOCKS = LOCAL_DIM_ELEMS * 2;
+
+  const int64_t token_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int lane_id = threadIdx.x;
+
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) return;
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  if (block_idx >= num_blocks || block_offset >= block_size) return;
+
+  const int half_head = head_size / 2;
+
+  const scalar_t* k_src =
+      key + token_idx * key_stride + head_idx * head_size;
+  const scalar_t* v_src =
+      value + token_idx * value_stride + head_idx * head_size;
+
+  // --- Phase A: load K/V elements into registers ----------------------------
+  float k_local[LOCAL_DIM_ELEMS];
+  float v_local[LOCAL_DIM_ELEMS];
+
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      k_local[i] = static_cast<float>(k_src[d]);
+      v_local[i] = static_cast<float>(v_src[d]);
+    } else {
+      k_local[i] = 0.0f;
+      v_local[i] = 0.0f;
+    }
+  }
+
+#if FP4_USE_IN_KERNEL_WHT
+  // WHT rotation (same as per-block kernel)
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      float sign = fp4_wht_sign(d);
+      k_local[i] *= sign;
+      v_local[i] *= sign;
+    }
+  }
+  for (int h = 1; h < warpSize && h < head_size; h *= 2) {
+    bool is_lower = (lane_id & h) == 0;
+#pragma unroll
+    for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+      if (lane_id + j * warpSize < head_size) {
+        float kp = __shfl_xor_sync(uint64_t(-1), k_local[j], h);
+        float vp = __shfl_xor_sync(uint64_t(-1), v_local[j], h);
+        k_local[j] = is_lower ? (k_local[j] + kp) : (kp - k_local[j]);
+        v_local[j] = is_lower ? (v_local[j] + vp) : (vp - v_local[j]);
+      }
+    }
+  }
+  for (int s = 1; s * warpSize < head_size; s *= 2) {
+#pragma unroll
+    for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+      int pj = j ^ s;
+      if (pj > j && pj < LOCAL_DIM_ELEMS
+          && lane_id + j  * warpSize < head_size
+          && lane_id + pj * warpSize < head_size) {
+        float ka = k_local[j] + k_local[pj];
+        float kb = k_local[j] - k_local[pj];
+        k_local[j]  = ka;
+        k_local[pj] = kb;
+        float va = v_local[j] + v_local[pj];
+        float vb = v_local[j] - v_local[pj];
+        v_local[j]  = va;
+        v_local[pj] = vb;
+      }
+    }
+  }
+  float wht_norm = rsqrtf(static_cast<float>(head_size));
+#pragma unroll
+  for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+    if (lane_id + j * warpSize < head_size) {
+      k_local[j] *= wht_norm;
+      v_local[j] *= wht_norm;
+    }
+  }
+#endif  // FP4_USE_IN_KERNEL_WHT
+
+  // --- Phase B: compute per-block-32 E8M0 scales ----------------------------
+  // Partial warp reductions keep each 32-lane half independent.
+  float k_block_scale_inv[MAX_BLOCKS];
+  float v_block_scale_inv[MAX_BLOCKS];
+  uint8_t k_e8m0_local[MAX_BLOCKS];
+  uint8_t v_e8m0_local[MAX_BLOCKS];
+
+  // K blocks
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      float k_abs = fabsf(k_local[i]);
+      for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2)
+        k_abs = fmaxf(k_abs,
+                      __shfl_xor_sync(uint64_t(-1), k_abs, off));
+      float blk_lo = __shfl_sync(uint64_t(-1), k_abs, 0);
+      float blk_hi = __shfl_sync(uint64_t(-1), k_abs, FP4_QUANT_BLOCK_SIZE);
+      int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
+      int b1 = b0 + 1;
+      if (b0 < num_k_quant_blocks) {
+        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-30f);
+        k_e8m0_local[b0] = float_to_e8m0(ideal);
+        float scale = e8m0_to_float(k_e8m0_local[b0]);
+        k_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
+      }
+      if (b1 < num_k_quant_blocks) {
+        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-30f);
+        k_e8m0_local[b1] = float_to_e8m0(ideal);
+        float scale = e8m0_to_float(k_e8m0_local[b1]);
+        k_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
+      }
+    }
+  }
+
+  // V blocks
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      float v_abs = fabsf(v_local[i]);
+      for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2)
+        v_abs = fmaxf(v_abs,
+                      __shfl_xor_sync(uint64_t(-1), v_abs, off));
+      float blk_lo = __shfl_sync(uint64_t(-1), v_abs, 0);
+      float blk_hi = __shfl_sync(uint64_t(-1), v_abs, FP4_QUANT_BLOCK_SIZE);
+      int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
+      int b1 = b0 + 1;
+      if (b0 < num_v_quant_blocks) {
+        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-30f);
+        v_e8m0_local[b0] = float_to_e8m0(ideal);
+        float scale = e8m0_to_float(v_e8m0_local[b0]);
+        v_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
+      }
+      if (b1 < num_v_quant_blocks) {
+        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-30f);
+        v_e8m0_local[b1] = float_to_e8m0(ideal);
+        float scale = e8m0_to_float(v_e8m0_local[b1]);
+        v_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
+      }
+    }
+  }
+
+  // --- Store E8M0 scales (uint8) --------------------------------------------
+  const int64_t k_blk_stride =
+      (num_k_quant_blocks > 1) ? (k_scale_stride_h / num_k_quant_blocks) : 0;
+  const int64_t v_blk_stride =
+      (num_v_quant_blocks > 1) ? (v_scale_stride_h / num_v_quant_blocks) : 0;
+  if (lane_id == 0) {
+    for (int b = 0; b < num_k_quant_blocks; b++) {
+      k_e8m0_scales[head_idx * k_scale_stride_h
+                     + b * k_blk_stride + slot_idx] = k_e8m0_local[b];
+    }
+    for (int b = 0; b < num_v_quant_blocks; b++) {
+      v_e8m0_scales[head_idx * v_scale_stride_h
+                     + b * v_blk_stride + slot_idx] = v_e8m0_local[b];
+    }
+  }
+
+  // --- Phase C: quantize to FP4 E2M1, pack pairs, write to cache -----------
+#if FP4_USE_IN_KERNEL_WHT
+  __shared__ float k_wht_smem_mx[512];
+  __shared__ float v_wht_smem_mx[512];
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      k_wht_smem_mx[d] = k_local[i];
+      v_wht_smem_mx[d] = v_local[i];
+    }
+  }
+#endif
+
+  uint8_t* k_dst = key_cache + block_idx * block_stride
+                    + block_offset * page_stride
+                    + head_idx * head_stride;
+  uint8_t* v_dst = value_cache + block_idx * block_stride
+                    + block_offset * page_stride
+                    + head_idx * head_stride;
+
+  for (int j = lane_id; j < half_head; j += warpSize) {
+    int d0 = 2 * j;
+    int d1 = d0 + 1;
+
+    int kb = d0 / FP4_QUANT_BLOCK_SIZE;
+    float k_sinv = k_block_scale_inv[kb];
+
+#if FP4_USE_IN_KERNEL_WHT
+    float kf0 = k_wht_smem_mx[d0] * k_sinv;
+    float kf1 = k_wht_smem_mx[d1] * k_sinv;
+#else
+    float kf0 = static_cast<float>(k_src[d0]) * k_sinv;
+    float kf1 = static_cast<float>(k_src[d1]) * k_sinv;
+#endif
+    uint8_t kn0 = fp4_e2m1_quantize_nibble(kf0);
+    uint8_t kn1 = fp4_e2m1_quantize_nibble(kf1);
+    k_dst[j] = (kn0 & 0xF) | ((kn1 & 0xF) << 4);
+
+    int vb = d0 / FP4_QUANT_BLOCK_SIZE;
+    float v_sinv = v_block_scale_inv[vb];
+
+#if FP4_USE_IN_KERNEL_WHT
+    float vf0 = v_wht_smem_mx[d0] * v_sinv;
+    float vf1 = v_wht_smem_mx[d1] * v_sinv;
+#else
+    float vf0 = static_cast<float>(v_src[d0]) * v_sinv;
+    float vf1 = static_cast<float>(v_src[d1]) * v_sinv;
+#endif
+    uint8_t vn0 = fp4_e2m1_quantize_nibble(vf0);
+    uint8_t vn1 = fp4_e2m1_quantize_nibble(vf1);
+    v_dst[j] = (vn0 & 0xF) | ((vn1 & 0xF) << 4);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// NVFP4 kernel: per-block-32 quantization with FP8 E4M3 scales (1 byte each).
+//
+// Identical structure to the MXFP4 kernel but stores scales as FP8 E4M3
+// instead of E8M0, providing ~3 mantissa bits of precision per scale
+// (vs 0 for E8M0).  Same 1-byte-per-scale storage cost.
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void reshape_and_cache_flash_fp4_nvfp4_kernel(
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    uint8_t* __restrict__ key_cache,
+    uint8_t* __restrict__ value_cache,
+    uint8_t* __restrict__ k_fp8_scales,
+    uint8_t* __restrict__ v_fp8_scales,
+    const int64_t* __restrict__ slot_mapping,
+    const int64_t key_stride,
+    const int64_t value_stride,
+    const int head_size,
+    const int block_size,
+    const int num_blocks,
+    const int64_t block_stride,
+    const int64_t page_stride,
+    const int64_t head_stride,
+    const int64_t k_scale_stride_h,
+    const int64_t v_scale_stride_h,
+    const int num_k_quant_blocks,
+    const int num_v_quant_blocks) {
+
+  constexpr float FP4_MAX = 6.0f;
+  constexpr int LOCAL_DIM_ELEMS = 8;
+  constexpr int FP4_QUANT_BLOCK_SIZE = 32;
+  constexpr int MAX_BLOCKS = LOCAL_DIM_ELEMS * 2;
+
+  const int64_t token_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int lane_id = threadIdx.x;
+
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) return;
+
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  if (block_idx >= num_blocks || block_offset >= block_size) return;
+
+  const int half_head = head_size / 2;
+
+  const scalar_t* k_src =
+      key + token_idx * key_stride + head_idx * head_size;
+  const scalar_t* v_src =
+      value + token_idx * value_stride + head_idx * head_size;
+
+  // --- Phase A: load K/V elements into registers ---
+  float k_local[LOCAL_DIM_ELEMS];
+  float v_local[LOCAL_DIM_ELEMS];
+
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      k_local[i] = static_cast<float>(k_src[d]);
+      v_local[i] = static_cast<float>(v_src[d]);
+    } else {
+      k_local[i] = 0.0f;
+      v_local[i] = 0.0f;
+    }
+  }
+
+#if FP4_USE_IN_KERNEL_WHT
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      float sign = fp4_wht_sign(d);
+      k_local[i] *= sign;
+      v_local[i] *= sign;
+    }
+  }
+  for (int h = 1; h < warpSize && h < head_size; h *= 2) {
+    bool is_lower = (lane_id & h) == 0;
+#pragma unroll
+    for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+      if (lane_id + j * warpSize < head_size) {
+        float kp = __shfl_xor_sync(uint64_t(-1), k_local[j], h);
+        float vp = __shfl_xor_sync(uint64_t(-1), v_local[j], h);
+        k_local[j] = is_lower ? (k_local[j] + kp) : (kp - k_local[j]);
+        v_local[j] = is_lower ? (v_local[j] + vp) : (vp - v_local[j]);
+      }
+    }
+  }
+  for (int s = 1; s * warpSize < head_size; s *= 2) {
+#pragma unroll
+    for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+      int pj = j ^ s;
+      if (pj > j && pj < LOCAL_DIM_ELEMS
+          && lane_id + j  * warpSize < head_size
+          && lane_id + pj * warpSize < head_size) {
+        float ka = k_local[j] + k_local[pj];
+        float kb = k_local[j] - k_local[pj];
+        k_local[j]  = ka;
+        k_local[pj] = kb;
+        float va = v_local[j] + v_local[pj];
+        float vb = v_local[j] - v_local[pj];
+        v_local[j]  = va;
+        v_local[pj] = vb;
+      }
+    }
+  }
+  float wht_norm = rsqrtf(static_cast<float>(head_size));
+#pragma unroll
+  for (int j = 0; j < LOCAL_DIM_ELEMS; j++) {
+    if (lane_id + j * warpSize < head_size) {
+      k_local[j] *= wht_norm;
+      v_local[j] *= wht_norm;
+    }
+  }
+#endif  // FP4_USE_IN_KERNEL_WHT
+
+  // --- Phase B: compute per-block-32 FP8 E4M3 scales ---
+  float k_block_scale_inv[MAX_BLOCKS];
+  float v_block_scale_inv[MAX_BLOCKS];
+  uint8_t k_fp8_local[MAX_BLOCKS];
+  uint8_t v_fp8_local[MAX_BLOCKS];
+
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      float k_abs = fabsf(k_local[i]);
+      for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2)
+        k_abs = fmaxf(k_abs,
+                      __shfl_xor_sync(uint64_t(-1), k_abs, off));
+      float blk_lo = __shfl_sync(uint64_t(-1), k_abs, 0);
+      float blk_hi = __shfl_sync(uint64_t(-1), k_abs, FP4_QUANT_BLOCK_SIZE);
+      int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
+      int b1 = b0 + 1;
+      if (b0 < num_k_quant_blocks) {
+        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-30f);
+        k_fp8_local[b0] = float_to_fp8_e4m3(ideal);
+        float scale = fp8_e4m3_to_float(k_fp8_local[b0]);
+        k_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
+      }
+      if (b1 < num_k_quant_blocks) {
+        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-30f);
+        k_fp8_local[b1] = float_to_fp8_e4m3(ideal);
+        float scale = fp8_e4m3_to_float(k_fp8_local[b1]);
+        k_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      float v_abs = fabsf(v_local[i]);
+      for (int off = FP4_QUANT_BLOCK_SIZE / 2; off > 0; off /= 2)
+        v_abs = fmaxf(v_abs,
+                      __shfl_xor_sync(uint64_t(-1), v_abs, off));
+      float blk_lo = __shfl_sync(uint64_t(-1), v_abs, 0);
+      float blk_hi = __shfl_sync(uint64_t(-1), v_abs, FP4_QUANT_BLOCK_SIZE);
+      int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
+      int b1 = b0 + 1;
+      if (b0 < num_v_quant_blocks) {
+        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-30f);
+        v_fp8_local[b0] = float_to_fp8_e4m3(ideal);
+        float scale = fp8_e4m3_to_float(v_fp8_local[b0]);
+        v_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
+      }
+      if (b1 < num_v_quant_blocks) {
+        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-30f);
+        v_fp8_local[b1] = float_to_fp8_e4m3(ideal);
+        float scale = fp8_e4m3_to_float(v_fp8_local[b1]);
+        v_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
+      }
+    }
+  }
+
+  // --- Store FP8 E4M3 scales (uint8) ---
+  const int64_t k_blk_stride =
+      (num_k_quant_blocks > 1) ? (k_scale_stride_h / num_k_quant_blocks) : 0;
+  const int64_t v_blk_stride =
+      (num_v_quant_blocks > 1) ? (v_scale_stride_h / num_v_quant_blocks) : 0;
+  if (lane_id == 0) {
+    for (int b = 0; b < num_k_quant_blocks; b++) {
+      k_fp8_scales[head_idx * k_scale_stride_h
+                    + b * k_blk_stride + slot_idx] = k_fp8_local[b];
+    }
+    for (int b = 0; b < num_v_quant_blocks; b++) {
+      v_fp8_scales[head_idx * v_scale_stride_h
+                    + b * v_blk_stride + slot_idx] = v_fp8_local[b];
+    }
+  }
+
+  // --- Phase C: quantize to FP4 E2M1, pack pairs, write to cache ---
+#if FP4_USE_IN_KERNEL_WHT
+  __shared__ float k_wht_smem_nv[512];
+  __shared__ float v_wht_smem_nv[512];
+#pragma unroll
+  for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
+    int d = lane_id + i * warpSize;
+    if (d < head_size) {
+      k_wht_smem_nv[d] = k_local[i];
+      v_wht_smem_nv[d] = v_local[i];
+    }
+  }
+#endif
+
+  uint8_t* k_dst = key_cache + block_idx * block_stride
+                    + block_offset * page_stride
+                    + head_idx * head_stride;
+  uint8_t* v_dst = value_cache + block_idx * block_stride
+                    + block_offset * page_stride
+                    + head_idx * head_stride;
+
+  for (int j = lane_id; j < half_head; j += warpSize) {
+    int d0 = 2 * j;
+    int d1 = d0 + 1;
+
+    int kb = d0 / FP4_QUANT_BLOCK_SIZE;
+    float k_sinv = k_block_scale_inv[kb];
+
+#if FP4_USE_IN_KERNEL_WHT
+    float kf0 = k_wht_smem_nv[d0] * k_sinv;
+    float kf1 = k_wht_smem_nv[d1] * k_sinv;
+#else
+    float kf0 = static_cast<float>(k_src[d0]) * k_sinv;
+    float kf1 = static_cast<float>(k_src[d1]) * k_sinv;
+#endif
+    uint8_t kn0 = fp4_e2m1_quantize_nibble(kf0);
+    uint8_t kn1 = fp4_e2m1_quantize_nibble(kf1);
+    k_dst[j] = (kn0 & 0xF) | ((kn1 & 0xF) << 4);
+
+    int vb = d0 / FP4_QUANT_BLOCK_SIZE;
+    float v_sinv = v_block_scale_inv[vb];
+
+#if FP4_USE_IN_KERNEL_WHT
+    float vf0 = v_wht_smem_nv[d0] * v_sinv;
+    float vf1 = v_wht_smem_nv[d1] * v_sinv;
+#else
+    float vf0 = static_cast<float>(v_src[d0]) * v_sinv;
+    float vf1 = static_cast<float>(v_src[d1]) * v_sinv;
+#endif
+    uint8_t vn0 = fp4_e2m1_quantize_nibble(vf0);
+    uint8_t vn1 = fp4_e2m1_quantize_nibble(vf1);
+    v_dst[j] = (vn0 & 0xF) | ((vn1 & 0xF) << 4);
+  }
+}
+
+}  // namespace vllm
+#endif  // USE_ROCM
+
+// ---------------------------------------------------------------------------
+// Per-channel-K / per-token-V FP4 cache write dispatch.
+// ---------------------------------------------------------------------------
+void reshape_and_cache_flash_fp4_per_channel_k_per_token_v(
+    torch::Tensor& key,              // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,            // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, block_size, num_heads, head_size/2]
+    torch::Tensor& value_cache,      // [num_blocks, block_size, num_heads, head_size/2]
+    torch::Tensor& k_channel_scales, // [num_heads, head_size]  (static per-channel K)
+    torch::Tensor& v_dequant_scales, // [num_heads, max_kv_tokens]  (dynamic per-token V)
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const std::string& kv_cache_dtype) {
+#ifdef USE_ROCM
+  TORCH_CHECK(kv_cache_dtype == "fp4" || kv_cache_dtype == "fp4_e2m1",
+              "per_channel_k_per_token_v only supports fp4/fp4_e2m1, got: ",
+              kv_cache_dtype);
+
+  int num_tokens = slot_mapping.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int block_size = key_cache.size(1);
+  int num_blocks = key_cache.size(0);
+
+  TORCH_CHECK(head_size % 2 == 0,
+              "FP4 per-channel-K requires even head_size, got ", head_size);
+  TORCH_CHECK(key_cache.dim() == 4,
+              "key_cache must be 4D [num_blocks, block_size, num_heads, head_size/2]");
+  TORCH_CHECK(value_cache.dim() == 4 &&
+              value_cache.sizes() == key_cache.sizes(),
+              "value_cache must have same shape as key_cache");
+  TORCH_CHECK(key_cache.size(3) == head_size / 2,
+              "cache last dim must be head_size/2");
+  TORCH_CHECK(k_channel_scales.dim() == 2 &&
+              k_channel_scales.size(0) == num_heads &&
+              k_channel_scales.size(1) == head_size,
+              "k_channel_scales must be [num_heads, head_size], got [",
+              k_channel_scales.size(0), ", ", k_channel_scales.size(1), "]");
+  TORCH_CHECK(v_dequant_scales.dim() == 2 &&
+              v_dequant_scales.size(0) == num_heads,
+              "v_dequant_scales must be [num_heads, max_kv_tokens]");
+
+  int64_t key_stride = key.stride(0);
+  int64_t value_stride = value.stride(0);
+  int64_t block_stride = key_cache.stride(0);
+  int64_t page_stride = key_cache.stride(1);
+  int64_t head_stride = key_cache.stride(2);
+  int64_t v_scale_stride_h = v_dequant_scales.stride(0);
+
+  dim3 grid(num_tokens, num_heads);
+  dim3 block(64);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+#define LAUNCH_FP4_PCK_PTV_KERNEL(scalar_type) \
+  vllm::reshape_and_cache_flash_fp4_perchannel_k_pertoken_v_kernel<scalar_type> \
+      <<<grid, block, 0, stream>>>( \
+          reinterpret_cast<scalar_type*>(key.data_ptr()), \
+          reinterpret_cast<scalar_type*>(value.data_ptr()), \
+          reinterpret_cast<uint8_t*>(key_cache.data_ptr()), \
+          reinterpret_cast<uint8_t*>(value_cache.data_ptr()), \
+          k_channel_scales.data_ptr<float>(), \
+          v_dequant_scales.data_ptr<float>(), \
+          slot_mapping.data_ptr<int64_t>(), \
+          key_stride, value_stride, head_size, block_size, num_blocks, \
+          block_stride, page_stride, head_stride, v_scale_stride_h)
+
+  if (key.dtype() == at::ScalarType::Half) {
+    LAUNCH_FP4_PCK_PTV_KERNEL(uint16_t);
+  } else if (key.dtype() == at::ScalarType::BFloat16) {
+    LAUNCH_FP4_PCK_PTV_KERNEL(__nv_bfloat16);
+  } else if (key.dtype() == at::ScalarType::Float) {
+    LAUNCH_FP4_PCK_PTV_KERNEL(float);
+  } else {
+    TORCH_CHECK(false, "Unsupported key/value dtype: ", key.dtype());
+  }
+#undef LAUNCH_FP4_PCK_PTV_KERNEL
+#else
+  TORCH_CHECK(false,
+              "reshape_and_cache_flash_fp4_per_channel_k_per_token_v is only "
+              "supported on ROCm");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// MXFP4 (OCP MX) block-scale FP4 cache write dispatch.
+//
+// Scales are E8M0 (power-of-2) stored as uint8.  Both K and V use
+// per-block-32 quantization with E8M0 scales.
+// ---------------------------------------------------------------------------
+void reshape_and_cache_flash_fp4_mxfp4(
+    torch::Tensor& key,              // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,            // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, block_size, num_heads, head_size/2]
+    torch::Tensor& value_cache,      // [num_blocks, block_size, num_heads, head_size/2]
+    torch::Tensor& k_e8m0_scales,    // [num_heads * num_k_blocks, max_kv_tokens] uint8
+    torch::Tensor& v_e8m0_scales,    // [num_heads * num_v_blocks, max_kv_tokens] uint8
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const std::string& kv_cache_dtype) {
+#ifdef USE_ROCM
+  TORCH_CHECK(kv_cache_dtype == "fp4" || kv_cache_dtype == "fp4_e2m1",
+              "reshape_and_cache_flash_fp4_mxfp4 only supports "
+              "fp4/fp4_e2m1, got: ", kv_cache_dtype);
+
+  int num_tokens = slot_mapping.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int block_size = key_cache.size(1);
+  int num_blocks = key_cache.size(0);
+  constexpr int FP4_QUANT_BLOCK_SIZE = 32;
+
+  TORCH_CHECK(head_size % 2 == 0,
+              "MXFP4 requires even head_size, got ", head_size);
+  TORCH_CHECK(head_size % FP4_QUANT_BLOCK_SIZE == 0,
+              "MXFP4 requires head_size divisible by 32, got ", head_size);
+  TORCH_CHECK(key_cache.dim() == 4,
+              "key_cache must be 4D [num_blocks, block_size, num_heads, "
+              "head_size/2]");
+  TORCH_CHECK(value_cache.dim() == 4 &&
+              value_cache.sizes() == key_cache.sizes(),
+              "value_cache must have same shape as key_cache");
+  TORCH_CHECK(key_cache.size(3) == head_size / 2,
+              "cache last dim must be head_size/2");
+  TORCH_CHECK(k_e8m0_scales.scalar_type() == at::ScalarType::Byte,
+              "k_e8m0_scales must be uint8 for MXFP4 E8M0 scales");
+  TORCH_CHECK(v_e8m0_scales.scalar_type() == at::ScalarType::Byte,
+              "v_e8m0_scales must be uint8 for MXFP4 E8M0 scales");
+
+  int num_k_quant_blocks = head_size / FP4_QUANT_BLOCK_SIZE;
+  int num_v_quant_blocks = head_size / FP4_QUANT_BLOCK_SIZE;
+
+  TORCH_CHECK(k_e8m0_scales.dim() == 2 &&
+              k_e8m0_scales.size(0) == num_heads * num_k_quant_blocks,
+              "k_e8m0_scales must be [num_heads*num_k_blocks, total_tokens]");
+  TORCH_CHECK(v_e8m0_scales.dim() == 2 &&
+              v_e8m0_scales.size(0) == num_heads * num_v_quant_blocks,
+              "v_e8m0_scales must be [num_heads*num_v_blocks, total_tokens]");
+
+  int64_t key_stride = key.stride(0);
+  int64_t value_stride = value.stride(0);
+  int64_t block_stride = key_cache.stride(0);
+  int64_t page_stride = key_cache.stride(1);
+  int64_t head_stride = key_cache.stride(2);
+  int64_t k_scale_stride_h = k_e8m0_scales.stride(0) * num_k_quant_blocks;
+  int64_t v_scale_stride_h = v_e8m0_scales.stride(0) * num_v_quant_blocks;
+
+  dim3 grid(num_tokens, num_heads);
+  dim3 block(64);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+#define LAUNCH_FP4_MXFP4_KERNEL(scalar_type) \
+  vllm::reshape_and_cache_flash_fp4_mxfp4_kernel<scalar_type> \
+      <<<grid, block, 0, stream>>>( \
+          reinterpret_cast<scalar_type*>(key.data_ptr()), \
+          reinterpret_cast<scalar_type*>(value.data_ptr()), \
+          reinterpret_cast<uint8_t*>(key_cache.data_ptr()), \
+          reinterpret_cast<uint8_t*>(value_cache.data_ptr()), \
+          k_e8m0_scales.data_ptr<uint8_t>(), \
+          v_e8m0_scales.data_ptr<uint8_t>(), \
+          slot_mapping.data_ptr<int64_t>(), \
+          key_stride, value_stride, head_size, block_size, num_blocks, \
+          block_stride, page_stride, head_stride, \
+          k_scale_stride_h, v_scale_stride_h, \
+          num_k_quant_blocks, num_v_quant_blocks)
+
+  if (key.dtype() == at::ScalarType::Half) {
+    LAUNCH_FP4_MXFP4_KERNEL(uint16_t);
+  } else if (key.dtype() == at::ScalarType::BFloat16) {
+    LAUNCH_FP4_MXFP4_KERNEL(__nv_bfloat16);
+  } else if (key.dtype() == at::ScalarType::Float) {
+    LAUNCH_FP4_MXFP4_KERNEL(float);
+  } else {
+    TORCH_CHECK(false, "Unsupported key/value dtype: ", key.dtype());
+  }
+#undef LAUNCH_FP4_MXFP4_KERNEL
+#else
+  TORCH_CHECK(false,
+              "reshape_and_cache_flash_fp4_mxfp4 is only supported on ROCm");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// NVFP4-style block-scale FP4 cache write dispatch.
+//
+// Scales are FP8 E4M3 FNUZ stored as uint8.  Both K and V use
+// per-block-32 quantization with FP8 E4M3 scales.
+// Provides ~5% better accuracy than MXFP4 E8M0 at same storage cost.
+// ---------------------------------------------------------------------------
+void reshape_and_cache_flash_fp4_nvfp4(
+    torch::Tensor& key,              // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,            // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, block_size, num_heads, head_size/2]
+    torch::Tensor& value_cache,      // [num_blocks, block_size, num_heads, head_size/2]
+    torch::Tensor& k_fp8_scales,     // [num_heads * num_k_blocks, max_kv_tokens] uint8
+    torch::Tensor& v_fp8_scales,     // [num_heads * num_v_blocks, max_kv_tokens] uint8
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const std::string& kv_cache_dtype) {
+#ifdef USE_ROCM
+  TORCH_CHECK(kv_cache_dtype == "fp4" || kv_cache_dtype == "fp4_e2m1",
+              "reshape_and_cache_flash_fp4_nvfp4 only supports "
+              "fp4/fp4_e2m1, got: ", kv_cache_dtype);
+
+  int num_tokens = slot_mapping.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int block_size = key_cache.size(1);
+  int num_blocks = key_cache.size(0);
+  constexpr int FP4_QUANT_BLOCK_SIZE = 32;
+
+  TORCH_CHECK(head_size % 2 == 0,
+              "NVFP4 requires even head_size, got ", head_size);
+  TORCH_CHECK(head_size % FP4_QUANT_BLOCK_SIZE == 0,
+              "NVFP4 requires head_size divisible by 32, got ", head_size);
+  TORCH_CHECK(key_cache.dim() == 4,
+              "key_cache must be 4D [num_blocks, block_size, num_heads, "
+              "head_size/2]");
+  TORCH_CHECK(value_cache.dim() == 4 &&
+              value_cache.sizes() == key_cache.sizes(),
+              "value_cache must have same shape as key_cache");
+  TORCH_CHECK(key_cache.size(3) == head_size / 2,
+              "cache last dim must be head_size/2");
+  TORCH_CHECK(k_fp8_scales.scalar_type() == at::ScalarType::Byte,
+              "k_fp8_scales must be uint8 for NVFP4 E4M3 scales");
+  TORCH_CHECK(v_fp8_scales.scalar_type() == at::ScalarType::Byte,
+              "v_fp8_scales must be uint8 for NVFP4 E4M3 scales");
+
+  int num_k_quant_blocks = head_size / FP4_QUANT_BLOCK_SIZE;
+  int num_v_quant_blocks = head_size / FP4_QUANT_BLOCK_SIZE;
+
+  TORCH_CHECK(k_fp8_scales.dim() == 2 &&
+              k_fp8_scales.size(0) == num_heads * num_k_quant_blocks,
+              "k_fp8_scales must be [num_heads*num_k_blocks, total_tokens]");
+  TORCH_CHECK(v_fp8_scales.dim() == 2 &&
+              v_fp8_scales.size(0) == num_heads * num_v_quant_blocks,
+              "v_fp8_scales must be [num_heads*num_v_blocks, total_tokens]");
+
+  int64_t key_stride = key.stride(0);
+  int64_t value_stride = value.stride(0);
+  int64_t block_stride = key_cache.stride(0);
+  int64_t page_stride = key_cache.stride(1);
+  int64_t head_stride = key_cache.stride(2);
+  int64_t k_scale_stride_h = k_fp8_scales.stride(0) * num_k_quant_blocks;
+  int64_t v_scale_stride_h = v_fp8_scales.stride(0) * num_v_quant_blocks;
+
+  dim3 grid(num_tokens, num_heads);
+  dim3 block(64);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+#define LAUNCH_FP4_NVFP4_KERNEL(scalar_type) \
+  vllm::reshape_and_cache_flash_fp4_nvfp4_kernel<scalar_type> \
+      <<<grid, block, 0, stream>>>( \
+          reinterpret_cast<scalar_type*>(key.data_ptr()), \
+          reinterpret_cast<scalar_type*>(value.data_ptr()), \
+          reinterpret_cast<uint8_t*>(key_cache.data_ptr()), \
+          reinterpret_cast<uint8_t*>(value_cache.data_ptr()), \
+          k_fp8_scales.data_ptr<uint8_t>(), \
+          v_fp8_scales.data_ptr<uint8_t>(), \
+          slot_mapping.data_ptr<int64_t>(), \
+          key_stride, value_stride, head_size, block_size, num_blocks, \
+          block_stride, page_stride, head_stride, \
+          k_scale_stride_h, v_scale_stride_h, \
+          num_k_quant_blocks, num_v_quant_blocks)
+
+  if (key.dtype() == at::ScalarType::Half) {
+    LAUNCH_FP4_NVFP4_KERNEL(uint16_t);
+  } else if (key.dtype() == at::ScalarType::BFloat16) {
+    LAUNCH_FP4_NVFP4_KERNEL(__nv_bfloat16);
+  } else if (key.dtype() == at::ScalarType::Float) {
+    LAUNCH_FP4_NVFP4_KERNEL(float);
+  } else {
+    TORCH_CHECK(false, "Unsupported key/value dtype: ", key.dtype());
+  }
+#undef LAUNCH_FP4_NVFP4_KERNEL
+#else
+  TORCH_CHECK(false,
+              "reshape_and_cache_flash_fp4_nvfp4 is only supported on ROCm");
+#endif
+}
+
+void reshape_and_cache_flash_with_pertoken_quant(
+    torch::Tensor& key,              // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,            // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, block_size, num_heads, head_size/2]
+    torch::Tensor& value_cache,      // [num_blocks, block_size, num_heads, head_size/2]
+    torch::Tensor& k_dequant_scales, // [num_heads * num_k_blocks, max_kv_tokens]
+    torch::Tensor& v_dequant_scales, // [num_heads * num_v_blocks, max_kv_tokens]
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const std::string& kv_cache_dtype) {
+#ifdef USE_ROCM
+  TORCH_CHECK(kv_cache_dtype == "fp4" || kv_cache_dtype == "fp4_e2m1",
+              "reshape_and_cache_flash_with_pertoken_quant only supports "
+              "fp4/fp4_e2m1 kv_cache_dtype, got: ", kv_cache_dtype);
+
+  int num_tokens = slot_mapping.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int block_size = key_cache.size(1);
+  int num_blocks = key_cache.size(0);
+
+  TORCH_CHECK(head_size % 2 == 0,
+              "FP4 per-token quant requires even head_size, got ", head_size);
+  TORCH_CHECK(key_cache.dim() == 4,
+              "FP4 per-token quant key_cache must be 4D "
+              "[num_blocks, block_size, num_heads, head_size/2]");
+  TORCH_CHECK(value_cache.dim() == 4 &&
+              value_cache.sizes() == key_cache.sizes(),
+              "FP4 per-token quant value_cache must have same shape as "
+              "key_cache");
+  int cache_head_dim = key_cache.size(3);
+  TORCH_CHECK(cache_head_dim == head_size / 2,
+              "FP4 per-token quant cache last dim must be head_size/2: "
+              "expected ", head_size / 2, ", got ", cache_head_dim);
+  TORCH_CHECK(v_dequant_scales.dim() == 2,
+              "V dequant scale tensor must be 2D "
+              "[num_heads * num_v_blocks, max_kv_tokens]");
+  TORCH_CHECK(k_dequant_scales.dim() == 2,
+              "K dequant scale tensor must be 2D "
+              "[num_heads * num_k_blocks, max_kv_tokens]");
+
+  constexpr int FP4_QUANT_BLOCK_SIZE = 32;
+  int num_k_quant_blocks = head_size / FP4_QUANT_BLOCK_SIZE;
+  if (num_k_quant_blocks < 1) num_k_quant_blocks = 1;
+  int num_v_quant_blocks = head_size / FP4_QUANT_BLOCK_SIZE;
+  if (num_v_quant_blocks < 1) num_v_quant_blocks = 1;
+
+  TORCH_CHECK(k_dequant_scales.size(0) == (int64_t)num_heads * num_k_quant_blocks,
+              "K dequant scale tensor dim 0 must be num_heads * num_k_blocks = ",
+              num_heads * num_k_quant_blocks, ", got ", k_dequant_scales.size(0));
+  TORCH_CHECK(v_dequant_scales.size(0) == (int64_t)num_heads * num_v_quant_blocks,
+              "V dequant scale tensor dim 0 must be num_heads * num_v_blocks = ",
+              num_heads * num_v_quant_blocks, ", got ", v_dequant_scales.size(0));
+
+  int64_t key_stride = key.stride(0);
+  int64_t value_stride = value.stride(0);
+  int64_t block_stride = key_cache.stride(0);
+  int64_t page_stride = key_cache.stride(1);
+  int64_t head_stride = key_cache.stride(2);
+  int64_t k_scale_stride_h = k_dequant_scales.stride(0) * num_k_quant_blocks;
+  int64_t v_scale_stride_h = v_dequant_scales.stride(0) * num_v_quant_blocks;
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
+
+  dim3 grid(num_tokens, num_heads);
+  dim3 block(64);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+#define LAUNCH_FP4_KERNEL(scalar_type) \
+  vllm::reshape_and_cache_flash_fp4_pertoken_quant_kernel<scalar_type> \
+      <<<grid, block, 0, stream>>>( \
+          reinterpret_cast<scalar_type*>(key.data_ptr()), \
+          reinterpret_cast<scalar_type*>(value.data_ptr()), \
+          reinterpret_cast<uint8_t*>(key_cache.data_ptr()), \
+          reinterpret_cast<uint8_t*>(value_cache.data_ptr()), \
+          k_dequant_scales.data_ptr<float>(), \
+          v_dequant_scales.data_ptr<float>(), \
+          slot_mapping.data_ptr<int64_t>(), \
+          key_stride, value_stride, head_size, block_size, num_blocks, \
+          block_stride, page_stride, head_stride, \
+          k_scale_stride_h, v_scale_stride_h, num_k_quant_blocks, \
+          num_v_quant_blocks)
+
+  if (key.dtype() == at::ScalarType::Half) {
+    LAUNCH_FP4_KERNEL(uint16_t);
+  } else if (key.dtype() == at::ScalarType::BFloat16) {
+    LAUNCH_FP4_KERNEL(__nv_bfloat16);
+  } else if (key.dtype() == at::ScalarType::Float) {
+    LAUNCH_FP4_KERNEL(float);
+  } else {
+    TORCH_CHECK(false, "Unsupported key/value dtype: ", key.dtype());
+  }
+#undef LAUNCH_FP4_KERNEL
+#else
+  TORCH_CHECK(false,
+              "reshape_and_cache_flash_with_pertoken_quant is only supported "
+              "on ROCm");
+#endif
 }
 
 // KV_T is the data type of key and value tensors.
@@ -808,21 +2617,26 @@ void convert_fp8(torch::Tensor& dst_cache, torch::Tensor& src_cache,
       CALL_CONVERT_FP8(__nv_bfloat16, uint8_t,
                        vllm::Fp8KVCacheDataType::kFp8E4M3);
     }
+#ifdef USE_ROCM
   } else if (kv_cache_dtype == "fp4" || kv_cache_dtype == "fp4_e2m1") {
     if (src_cache.dtype() == at::ScalarType::Float) {
-      FN(float, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
+      CALL_CONVERT_FP8(uint8_t, float, vllm::Fp8KVCacheDataType::kFp4E2M1);
     } else if (src_cache.dtype() == at::ScalarType::Half) {
-      FN(ck_tile::fp16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1); 
+      CALL_CONVERT_FP8(uint8_t, uint16_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
     } else if (src_cache.dtype() == at::ScalarType::BFloat16) {
-      FN(ck_tile::bf16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
+      CALL_CONVERT_FP8(uint8_t, __nv_bfloat16,
+                       vllm::Fp8KVCacheDataType::kFp4E2M1);
     } else if (dst_cache.dtype() == at::ScalarType::Float) {
-      FN(uint8_t, float, vllm::Fp8KVCacheDataType::kFp4E2M1);
+      CALL_CONVERT_FP8(float, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
     } else if (dst_cache.dtype() == at::ScalarType::Half) {
-      FN(uint8_t, ck_tile::fp16_t, vllm::Fp8KVCacheDataType::kFp4E2M1); 
+      CALL_CONVERT_FP8(uint16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
     } else if (dst_cache.dtype() == at::ScalarType::BFloat16) {
-      FN(uint8_t, ck_tile::bf16_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
+      CALL_CONVERT_FP8(__nv_bfloat16, uint8_t,
+                       vllm::Fp8KVCacheDataType::kFp4E2M1);
     }
-  } else {
+  }
+#endif
+  else {
     TORCH_CHECK(false, "Unsupported data type: ", kv_cache_dtype);
   }
 }

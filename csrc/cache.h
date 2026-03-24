@@ -22,6 +22,54 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
                              const std::string& kv_cache_dtype,
                              torch::Tensor& k_scale, torch::Tensor& v_scale);
 
+void reshape_and_cache_flash_with_pertoken_quant(
+    torch::Tensor& key,              // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,            // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, block_size, num_heads,
+                                     //  head_size/2]
+    torch::Tensor& value_cache,      // [num_blocks, block_size, num_heads,
+                                     //  head_size/2]
+    torch::Tensor& k_dequant_scales, // [num_heads * num_k_blocks, max_kv_tokens]
+    torch::Tensor& v_dequant_scales, // [num_heads * num_v_blocks, max_kv_tokens]
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const std::string& kv_cache_dtype);
+
+void reshape_and_cache_flash_fp4_per_channel_k_per_token_v(
+    torch::Tensor& key,              // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,            // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, block_size, num_heads,
+                                     //  head_size/2]
+    torch::Tensor& value_cache,      // [num_blocks, block_size, num_heads,
+                                     //  head_size/2]
+    torch::Tensor& k_channel_scales, // [num_heads, head_size] static per-channel
+    torch::Tensor& v_dequant_scales, // [num_heads, max_kv_tokens] per-token
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const std::string& kv_cache_dtype);
+
+void reshape_and_cache_flash_fp4_mxfp4(
+    torch::Tensor& key,              // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,            // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, block_size, num_heads,
+                                     //  head_size/2]
+    torch::Tensor& value_cache,      // [num_blocks, block_size, num_heads,
+                                     //  head_size/2]
+    torch::Tensor& k_e8m0_scales,    // [num_heads*num_k_blocks, total] uint8
+    torch::Tensor& v_e8m0_scales,    // [num_heads*num_v_blocks, total] uint8
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const std::string& kv_cache_dtype);
+
+void reshape_and_cache_flash_fp4_nvfp4(
+    torch::Tensor& key,              // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,            // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, block_size, num_heads,
+                                     //  head_size/2]
+    torch::Tensor& value_cache,      // [num_blocks, block_size, num_heads,
+                                     //  head_size/2]
+    torch::Tensor& k_fp8_scales,     // [num_heads*num_k_blocks, total] uint8
+    torch::Tensor& v_fp8_scales,     // [num_heads*num_v_blocks, total] uint8
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const std::string& kv_cache_dtype);
+
 void concat_and_cache_mla(torch::Tensor& kv_c, torch::Tensor& k_pe,
                           torch::Tensor& kv_cache, torch::Tensor& slot_mapping,
                           const std::string& kv_cache_dtype,

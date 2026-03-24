@@ -30,6 +30,7 @@ CacheDType = Literal[
     "fp8_inc",
     "fp8_ds_mla",
     "fp4",
+    "fp4_e2m1",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
@@ -61,7 +62,8 @@ class CacheConfig:
     cache_dtype: CacheDType = "auto"
     """Data type for kv cache storage. If "auto", will use model data type.
     CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ROCm (AMD GPU) supports
-    fp8 (=fp8_e4m3). Intel Gaudi (HPU) supports fp8 (using fp8_inc).
+    fp8 (=fp8_e4m3) and fp4 (fp4_e2m1); fp4 is not supported on NVIDIA.
+    Intel Gaudi (HPU) supports fp8 (using fp8_inc).
     Some models (namely DeepSeekV3.2) default to fp8, set to bfloat16 to use
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.
@@ -203,6 +205,16 @@ class CacheConfig:
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
+        if cache_dtype.startswith("fp4"):
+            import torch
+            from vllm.platforms import current_platform
+            if not current_platform.is_rocm():
+                raise ValueError(
+                    "fp4 / fp4_e2m1 kv cache is only supported on AMD GPUs "
+                    "(ROCm). It is not supported on NVIDIA GPUs."
+                )
+            # On ROCm, the extension must have been built with HIP (USE_ROCM).
+            # Otherwise we get "Unsupported data type of kv cache: fp4" at runtime.
         if cache_dtype.startswith("fp8"):
             logger.info(
                 "Using fp8 data type to store kv cache. It reduces the GPU "

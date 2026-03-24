@@ -67,6 +67,8 @@ class AttentionSpec(KVCacheSpec):
     head_size: int
     dtype: torch.dtype
     page_size_padded: int | None = None
+    # When "fp4" or "fp4_e2m1", page uses half the bytes (2 values per byte).
+    cache_dtype_str: str | None = None
 
     @property
     def page_size_bytes(self) -> int:
@@ -78,13 +80,17 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        return (
+        base = (
             2
             * self.block_size
             * self.num_kv_heads
             * self.head_size
             * get_dtype_size(self.dtype)
         )
+        # FP4 uses 4 bits per value (2 values per byte) → half the page size.
+        if (self.cache_dtype_str or "").startswith("fp4"):
+            return base // 2
+        return base
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -160,6 +166,7 @@ class FullAttentionSpec(AttentionSpec):
             head_size_v=specs[0].head_size_v,
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
+            cache_dtype_str=specs[0].cache_dtype_str,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )
@@ -179,12 +186,16 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        return (
+        base = (
             self.block_size
             * self.num_kv_heads
             * (self.head_size + self.head_size_v)
             * get_dtype_size(self.dtype)
         )
+        # FP4 uses 4 bits per value (2 values per byte) → half the page size.
+        if (self.cache_dtype_str or "").startswith("fp4"):
+            return base // 2
+        return base
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -347,6 +358,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sink_len=specs[0].sink_len,
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
+            cache_dtype_str=specs[0].cache_dtype_str,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )

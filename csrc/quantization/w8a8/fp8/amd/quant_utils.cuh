@@ -1,5 +1,6 @@
 #pragma once
 #include <hip/hip_fp8.h>
+#include <type_traits>
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
@@ -612,6 +613,35 @@ scaled_vec_conversion<uint32_t, float4>(const float4& a, float scale) {
 }
   #endif  // ENABLE_FP8
 
+// FP4 E2M1 (MXFP4) scalar conversion for KV cache: 4 bits per value, one per
+// byte (low nibble). Same format as NVIDIA for compatibility.
+__inline__ __device__ float fp4_e2m1_bits_to_float(uint8_t bits) {
+  bits &= 0x0f;
+  const float fp4_e2m1_vals[16] = {
+      0.f,    0.5f,  0.75f, 1.f,   1.5f,  2.f,   3.f,   4.f,
+      6.f,    -0.5f, -0.75f, -1.f, -1.5f, -2.f, -3.f, -6.f,
+  };
+  return fp4_e2m1_vals[bits];
+}
+
+__inline__ __device__ uint8_t float_to_fp4_e2m1_bits(float x) {
+  const float fp4_e2m1_vals[16] = {
+      0.f,    0.5f,  0.75f, 1.f,   1.5f,  2.f,   3.f,   4.f,
+      6.f,    -0.5f, -0.75f, -1.f, -1.5f, -2.f, -3.f, -6.f,
+  };
+  x = fminf(fmaxf(x, -6.f), 6.f);
+  int best = 0;
+  float best_err = fabsf(x);
+  for (int i = 1; i < 16; ++i) {
+    float err = fabsf(x - fp4_e2m1_vals[i]);
+    if (err < best_err) {
+      best_err = err;
+      best = i;
+    }
+  }
+  return static_cast<uint8_t>(best);
+}
+
 template <typename Tout, typename Tin, Fp8KVCacheDataType kv_dt>
 __inline__ __device__ Tout convert(const Tin& x) {
   #ifdef ENABLE_FP8
@@ -630,6 +660,48 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale) {
     return scaled_vec_conversion<Tout, Tin>(x, scale);
   }
   #endif
+  if constexpr (kv_dt == Fp8KVCacheDataType::kFp4E2M1) {
+    if constexpr (std::is_same_v<Tout, uint8_t>) {
+      float f;
+      if constexpr (std::is_same_v<Tin, float>) {
+        f = x;
+      } else if constexpr (std::is_same_v<Tin, uint16_t>) {
+        union {
+          __half h;
+          uint16_t u;
+        } u;
+        u.u = x;
+        f = __half2float(u.h);
+      } else if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {
+        f = __bfloat162float(x);
+      } else {
+        assert(false);
+        return 0;
+      }
+      return float_to_fp4_e2m1_bits(f / scale);
+    } else if constexpr (std::is_same_v<Tin, uint8_t>) {
+      float f = fp4_e2m1_bits_to_float(x) * scale;
+      if constexpr (std::is_same_v<Tout, float>) {
+        return f;
+      } else if constexpr (std::is_same_v<Tout, uint16_t>) {
+        __half h = __float2half(f);
+        union {
+          __half h;
+          uint16_t u;
+        } u;
+        u.h = h;
+        return u.u;
+      } else if constexpr (std::is_same_v<Tout, __nv_bfloat16>) {
+        return __float2bfloat16(f);
+      } else {
+        assert(false);
+        return Tout{};
+      }
+    } else {
+      assert(false);
+      return Tout{};
+    }
+  }
   assert(false);
   return {};  // Squash missing return statement warning
 }

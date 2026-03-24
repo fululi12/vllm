@@ -1184,6 +1184,7 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
                     num_kv_heads=spec.num_kv_heads,
                     head_size=spec.head_size,
                     dtype=spec.dtype,
+                    cache_dtype_str=spec.cache_dtype_str,
                     sliding_window=spec.sliding_window,
                 )
             elif isinstance(spec, ChunkedLocalAttentionSpec):
@@ -1192,6 +1193,7 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
                     num_kv_heads=spec.num_kv_heads,
                     head_size=spec.head_size,
                     dtype=spec.dtype,
+                    cache_dtype_str=getattr(spec, "cache_dtype_str", None),
                     attention_chunk_size=spec.attention_chunk_size,
                 )
 
@@ -1302,7 +1304,24 @@ def _report_kv_cache_config(
             dcp_size,
         )
     num_tokens_str = f"{num_tokens:,}"
-    logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    # FP4/fp4_e2m1 and FP8 use uint8 storage; show dtype so "GPU KV cache size" is clear.
+    if cache_dtype and cache_dtype.startswith("fp4"):
+        logger.info_once(
+            "GPU KV cache size: %s tokens (%s)",
+            num_tokens_str,
+            cache_dtype,
+            scope="local",
+        )
+    elif cache_dtype and cache_dtype.startswith("fp8"):
+        logger.info_once(
+            "GPU KV cache size: %s tokens (%s)",
+            num_tokens_str,
+            cache_dtype,
+            scope="local",
+        )
+    else:
+        logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
     max_concurrency = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
