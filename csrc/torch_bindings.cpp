@@ -53,6 +53,20 @@ void reshape_and_cache_flash_fp4_amxfp4(
               "Please rebuild vLLM with the updated cache_kernels.cu.");
 }
 
+#ifdef __GNUC__
+__attribute__((weak))
+#endif
+void reshape_and_cache_flash_with_pertoken_quant(
+    torch::Tensor& key, torch::Tensor& value,
+    torch::Tensor& key_cache, torch::Tensor& value_cache,
+    torch::Tensor& k_dequant_scales, torch::Tensor& v_dequant_scales,
+    torch::Tensor& slot_mapping,
+    const std::string& kv_cache_dtype) {
+  TORCH_CHECK(false,
+              "reshape_and_cache_flash_with_pertoken_quant is not compiled. "
+              "Please rebuild vLLM with the updated cache_kernels.cu.");
+}
+
 // Note on op signatures:
 // The X_meta signatures are for the meta functions corresponding to op X.
 // They must be kept in sync with the signature for X. Generally, only

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+logger = init_logger(__name__)
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
@@ -73,6 +76,8 @@ _FP4_MXFP4 = os.environ.get("VLLM_FP4_MXFP4", "0") == "1"
 # Set VLLM_FP4_NVFP4=1 to enable.
 _FP4_NVFP4 = os.environ.get("VLLM_FP4_NVFP4", "0") == "1"
 _NVFP4_OP_CHECKED = False
+_NVFP4_HAS_DIRECT_OP = False
+_NVFP4_HAS_PERTOKEN_OP = False
 
 # Signal offset for PA kernel to distinguish NVFP4 E4M3 from MXFP4 E8M0.
 # fp4_num_k/v_blocks <= -_NVFP4_SIGNAL_OFFSET → NVFP4 E4M3 mode
@@ -115,24 +120,736 @@ def _ensure_amxfp4_op_available():
 
 
 def _ensure_nvfp4_op_available():
-    """Lazy check: disable NVFP4 mode if the C++ op wasn't compiled."""
+    """Lazy check NVFP4 kernel availability.
+
+    Prefer the native C++ NVFP4 cache-write kernel because it writes the
+    final FP8 E4M3 scale bytes directly. If it is missing or unhealthy at
+    runtime, we fall back to the float32 per-token kernel plus Python-side
+    FP8 conversion.
+    """
     global _FP4_NVFP4, _NVFP4_OP_CHECKED
+    global _NVFP4_HAS_DIRECT_OP, _NVFP4_HAS_PERTOKEN_OP
     if _NVFP4_OP_CHECKED:
         return
     _NVFP4_OP_CHECKED = True
     if not _FP4_NVFP4:
         return
-    if not hasattr(torch.ops, "_C_cache_ops") or not hasattr(
-        torch.ops._C_cache_ops, "reshape_and_cache_flash_fp4_nvfp4"
-    ):
+
+    has_cache_ops = hasattr(torch.ops, "_C_cache_ops")
+    has_direct = has_cache_ops and hasattr(
+        torch.ops._C_cache_ops,
+        "reshape_and_cache_flash_fp4_nvfp4",
+    )
+    has_pertoken = has_cache_ops and hasattr(
+        torch.ops._C_cache_ops,
+        "reshape_and_cache_flash_with_pertoken_quant",
+    )
+    _NVFP4_HAS_DIRECT_OP = has_direct
+    _NVFP4_HAS_PERTOKEN_OP = has_pertoken
+
+    if has_direct:
+        logger.info(
+            "NVFP4: native reshape_and_cache_flash_fp4_nvfp4 "
+            "cache-write kernel detected")
+    if has_pertoken:
+        logger.info(
+            "NVFP4: float32 pertoken kernel "
+            "reshape_and_cache_flash_with_pertoken_quant detected")
+    if not has_direct and not has_pertoken:
         logger.warning(
-            "VLLM_FP4_NVFP4=1 is set but reshape_and_cache_flash_fp4_nvfp4 "
-            "is not available in the compiled C++ extension. "
-            "Falling back to MXFP4 mode if VLLM_FP4_MXFP4=1, or default "
-            "per-token mode. Please rebuild vLLM with the updated C++ files "
-            "(cache.h, cache_kernels.cu, torch_bindings.cpp)."
+            "VLLM_FP4_NVFP4=1: no C++ cache-write kernels found. "
+            "Will use pure Python FP4 quantization (slower). "
+            "Rebuild vLLM for full performance.")
+
+
+_MXFP4_OP_CHECKED = False
+
+
+def _ensure_mxfp4_op_available():
+    """Lazy check: log whether the MXFP4 C++ kernel is available."""
+    global _MXFP4_OP_CHECKED
+    if _MXFP4_OP_CHECKED:
+        return
+    _MXFP4_OP_CHECKED = True
+    if not _FP4_MXFP4:
+        return
+    has_cache_ops = hasattr(torch.ops, "_C_cache_ops")
+    has_mxfp4 = has_cache_ops and hasattr(
+        torch.ops._C_cache_ops,
+        "reshape_and_cache_flash_fp4_mxfp4",
+    )
+    if has_mxfp4:
+        logger.info(
+            "MXFP4: native reshape_and_cache_flash_fp4_mxfp4 "
+            "cache-write kernel detected")
+    else:
+        logger.warning(
+            "VLLM_FP4_MXFP4=1: C++ MXFP4 kernel not found. "
+            "Will use pure Python MXFP4 fallback (slower). "
+            "Rebuild vLLM for full performance.")
+
+
+_NVFP4_WRITE_DIAGNOSED = False
+_NVFP4_DECODE_DIAGNOSED = False
+_FP4_DECODE_MODE_LOGGED = False
+_FP4_WRITE_MODE_LOGGED = False
+_FP4_BRANCH_LOGGED = False
+_MXFP4_WRITE_DIAGNOSED = False
+_MXFP4_WRITE_ROUNDTRIP_DONE = False
+_NVFP4_NATIVE_VALIDATED = False
+
+logger.info(
+    "FP4 KV-cache env vars: "
+    "HADAMARD=%s IN_KERNEL_WHT=%s PER_CHANNEL_K=%s "
+    "MXFP4=%s NVFP4=%s AMXFP4=%s  "
+    "Active mode: %s",
+    _FP4_HADAMARD, _FP4_IN_KERNEL_WHT, _FP4_PER_CHANNEL_K,
+    _FP4_MXFP4, _FP4_NVFP4, _FP4_AMXFP4,
+    ("AMXFP4" if _FP4_AMXFP4 else
+     "NVFP4" if _FP4_NVFP4 else
+     "MXFP4" if _FP4_MXFP4 else
+     "PER_CHANNEL_K" if _FP4_PER_CHANNEL_K else
+     "DEFAULT (per-block-32 float32 scales)"),
+)
+_NVFP4_NATIVE_VALIDATION_PASSES = 0
+_NVFP4_NATIVE_VALIDATION_REQUIRED = 3
+_NVFP4_USING_PYTHON_FALLBACK = False
+_MXFP4_KERNEL_VALIDATED = False
+_MXFP4_USE_PYTHON_FALLBACK = (
+    os.environ.get("VLLM_FP4_MXFP4_CPP", "0") != "1"
+)
+
+
+def _fp4_e2m1_quantize_tensor(x: torch.Tensor) -> torch.Tensor:
+    """Vectorized FP4 E2M1 quantization: float → uint8 nibble (0..15).
+
+    E2M1 representable magnitudes: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}.
+    Input is expected to be pre-normalized by the block scale (values in
+    roughly [-6, +6]).
+    """
+    sign = (x < 0).to(torch.uint8) * 8
+    a = x.abs()
+    nibble = torch.zeros_like(a, dtype=torch.uint8)
+    nibble = torch.where(a < 0.25, torch.zeros_like(nibble), nibble)
+    nibble = torch.where((a >= 0.25) & (a < 0.75),
+                         torch.ones_like(nibble), nibble)
+    nibble = torch.where((a >= 0.75) & (a < 1.25),
+                         torch.full_like(nibble, 2), nibble)
+    nibble = torch.where((a >= 1.25) & (a < 1.75),
+                         torch.full_like(nibble, 3), nibble)
+    nibble = torch.where((a >= 1.75) & (a < 2.5),
+                         torch.full_like(nibble, 4), nibble)
+    nibble = torch.where((a >= 2.5) & (a < 3.5),
+                         torch.full_like(nibble, 5), nibble)
+    nibble = torch.where((a >= 3.5) & (a < 5.0),
+                         torch.full_like(nibble, 6), nibble)
+    nibble = torch.where(a >= 5.0,
+                         torch.full_like(nibble, 7), nibble)
+    return sign | nibble
+
+
+def _nvfp4_write_cache_python(
+    cache_key: torch.Tensor,
+    cache_value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    k_fp8_2d: torch.Tensor,
+    v_fp8_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    total_tokens: int,
+):
+    """Pure-Python FP4 E2M1 quantization with FP8 E4M3 block-32 scales.
+
+    This is the last-resort fallback when no C++ kernel is available or
+    they produce incorrect (all-zero) scales.  Fully vectorised in PyTorch
+    except for the per-slot scatter into the paged cache.
+    """
+    FP4_MAX = 6.0
+    BLOCK_SIZE = FP4_QUANT_BLOCK_SIZE
+
+    valid_mask = slot_mapping >= 0
+    if not valid_mask.any():
+        return
+
+    valid_token_indices = torch.where(valid_mask)[0]
+    valid_slots = slot_mapping[valid_mask]
+    V = valid_token_indices.size(0)
+
+    _, num_heads, head_size = cache_key.shape
+    num_blocks = head_size // BLOCK_SIZE
+    half_head = head_size // 2
+    cache_block_size = key_cache.size(1)
+
+    for src, dst_cache, fp8_buf in [
+        (cache_key, key_cache, k_fp8_2d),
+        (cache_value, value_cache, v_fp8_2d),
+    ]:
+        vals = src[valid_token_indices].float()  # [V, H, D]
+        vals_blocks = vals.view(V, num_heads, num_blocks, BLOCK_SIZE)
+
+        absmax = vals_blocks.abs().amax(dim=-1)  # [V, H, B]
+        scales = torch.clamp(absmax / FP4_MAX, min=1e-3)
+        scales_inv = 1.0 / scales
+
+        normalized = vals_blocks * scales_inv.unsqueeze(-1)
+        fp4_nibbles = _fp4_e2m1_quantize_tensor(normalized)  # [V,H,B,32]
+
+        fp4_lo = fp4_nibbles[:, :, :, 0::2]
+        fp4_hi = fp4_nibbles[:, :, :, 1::2]
+        fp4_packed = (fp4_lo & 0xF) | ((fp4_hi & 0xF) << 4)
+        fp4_packed = fp4_packed.reshape(V, num_heads, half_head)
+
+        cache_block_indices = valid_slots // cache_block_size
+        cache_block_offsets = valid_slots % cache_block_size
+        for i in range(V):
+            bi = cache_block_indices[i].item()
+            bo = cache_block_offsets[i].item()
+            dst_cache[bi, bo, :, :] = fp4_packed[i].to(torch.uint8)
+
+        fp8_scales = _float_to_fp8_e4m3(
+            scales.view(V, num_heads * num_blocks))  # [V, H*B]
+        stride_h = num_blocks * total_tokens
+        hb_indices = torch.arange(
+            num_heads * num_blocks, device=src.device)
+        h_idx = hb_indices // num_blocks
+        b_idx = hb_indices % num_blocks
+        base_offsets = h_idx * stride_h + b_idx * total_tokens  # [H*B]
+
+        flat_indices = (
+            base_offsets.unsqueeze(0) + valid_slots.unsqueeze(1)
+        )  # [V, H*B]
+        fp8_buf.view(-1).scatter_(
+            0, flat_indices.reshape(-1), fp8_scales.reshape(-1))
+
+
+def _mxfp4_write_cache_python(
+    cache_key: torch.Tensor,
+    cache_value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    k_e8m0_2d: torch.Tensor,
+    v_e8m0_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    total_tokens: int,
+):
+    """Pure-Python fallback for MXFP4 E8M0 per-block-32 write path.
+
+    Computes per-block-32 absmax, converts to E8M0 (nearest power-of-2),
+    quantizes to FP4 E2M1, and scatters into the paged cache.
+    """
+    FP4_MAX = 6.0
+    BLOCK_SIZE = FP4_QUANT_BLOCK_SIZE
+
+    valid_mask = slot_mapping >= 0
+    if not valid_mask.any():
+        return
+
+    valid_indices = torch.where(valid_mask)[0]
+    valid_slots = slot_mapping[valid_mask]
+    V = valid_indices.size(0)
+
+    _, num_heads, hs = cache_key.shape
+    num_blocks = max(1, hs // BLOCK_SIZE)
+    half_head = hs // 2
+    cache_block_size = key_cache.size(1)
+
+    for src, dst_cache, e8m0_buf in [
+        (cache_key, key_cache, k_e8m0_2d),
+        (cache_value, value_cache, v_e8m0_2d),
+    ]:
+        vals = src[valid_indices].float()
+        vals_blk = vals.view(V, num_heads, num_blocks, BLOCK_SIZE)
+        absmax = vals_blk.abs().amax(dim=-1)
+        ideal = torch.clamp(absmax / FP4_MAX, min=1e-10)
+
+        log2_ideal = torch.log2(ideal)
+        e8m0_vals = torch.round(log2_ideal).long() + 127
+        e8m0_vals = torch.clamp(e8m0_vals, min=1, max=254)
+        e8m0_bytes = e8m0_vals.to(torch.uint8)
+
+        scales = torch.pow(2.0, (e8m0_vals.float() - 127.0))
+        scales_inv = 1.0 / scales
+
+        normalized = vals_blk * scales_inv.unsqueeze(-1)
+        fp4_nibbles = _fp4_e2m1_quantize_tensor(normalized)
+        fp4_flat = fp4_nibbles.reshape(V, num_heads, -1)
+        fp4_lo = fp4_flat[:, :, 0::2]
+        fp4_hi = fp4_flat[:, :, 1::2]
+        fp4_packed = (fp4_lo & 0xF) | ((fp4_hi & 0xF) << 4)
+        fp4_packed = fp4_packed.reshape(V, num_heads, half_head)
+
+        block_idx = valid_slots // cache_block_size
+        block_off = valid_slots % cache_block_size
+        for i in range(V):
+            bi = block_idx[i].item()
+            bo = block_off[i].item()
+            dst_cache[bi, bo, :, :] = fp4_packed[i].to(torch.uint8)
+
+        e8m0_flat = e8m0_bytes.view(V, num_heads * num_blocks)
+        stride_h = num_blocks * total_tokens
+        hb = torch.arange(num_heads * num_blocks, device=src.device)
+        h_idx = hb // num_blocks
+        b_idx = hb % num_blocks
+        base = h_idx * stride_h + b_idx * total_tokens
+        flat_idx = base.unsqueeze(0) + valid_slots.unsqueeze(1)
+        e8m0_buf.view(-1).scatter_(
+            0, flat_idx.reshape(-1), e8m0_flat.reshape(-1))
+
+    global _MXFP4_WRITE_ROUNDTRIP_DONE
+    if not _MXFP4_WRITE_ROUNDTRIP_DONE:
+        _MXFP4_WRITE_ROUNDTRIP_DONE = True
+        try:
+            torch.cuda.current_stream(
+                key_cache.device).synchronize()
+            k_e = k_e8m0_2d.view(-1)
+            v_e = v_e8m0_2d.view(-1)
+            sm = slot_mapping[slot_mapping >= 0]
+            n_s = min(32, sm.numel())
+            if n_s > 0:
+                s_idx = sm[:n_s]
+                k_samp = k_e[s_idx]
+                v_samp = v_e[s_idx]
+                k127 = int((k_samp == 127).sum().item())
+                v127 = int((v_samp == 127).sum().item())
+                k_mn = int(k_samp.min().item())
+                k_mx = int(k_samp.max().item())
+                v_mn = int(v_samp.min().item())
+                v_mx = int(v_samp.max().item())
+                k_u = int(k_samp.unique().numel())
+                v_u = int(v_samp.unique().numel())
+                logger.info(
+                    "MXFP4 post-write verify (%d cached "
+                    "slots sampled, head0 blk0): "
+                    "K e8m0 min=%d max=%d unique=%d "
+                    "n_127=%d/%d  "
+                    "V e8m0 min=%d max=%d unique=%d "
+                    "n_127=%d/%d",
+                    n_s,
+                    k_mn, k_mx, k_u, k127, n_s,
+                    v_mn, v_mx, v_u, v127, n_s,
+                )
+                if k127 == n_s and v127 == n_s:
+                    logger.error(
+                        "MXFP4 post-write: ALL sampled "
+                        "E8M0 bytes are 127 (scale=1.0). "
+                        "This means the Python fallback "
+                        "computed scale=1.0 for every "
+                        "block, which should NOT happen "
+                        "for real model data. Check that "
+                        "cache_key/cache_value contain "
+                        "non-trivial values.")
+
+            _FP4_LUT = torch.tensor(
+                [0., .5, 1., 1.5, 2., 3., 4., 6.],
+                device=key_cache.device)
+            _n_rt = min(4, n_s)
+            if _n_rt > 0:
+                _rt_slot = s_idx[:_n_rt]
+                _cbs = key_cache.size(1)
+                _bi = _rt_slot // _cbs
+                _bo = _rt_slot % _cbs
+                _orig = cache_key[
+                    valid_indices[:_n_rt]].float()
+                for _ti in range(_n_rt):
+                    _b = int(_bi[_ti].item())
+                    _o = int(_bo[_ti].item())
+                    _cached_bytes = key_cache[
+                        _b, _o, 0, :8].clone()
+                    _orig_h0 = _orig[_ti, 0, :16]
+                    _lo = _cached_bytes & 0xF
+                    _hi = (_cached_bytes >> 4) & 0xF
+                    _sign_lo = ((_lo >> 3) & 1).float()
+                    _mag_lo = _FP4_LUT[
+                        (_lo & 7).long()]
+                    _sign_hi = ((_hi >> 3) & 1).float()
+                    _mag_hi = _FP4_LUT[
+                        (_hi & 7).long()]
+                    _dq_lo = (1 - 2 * _sign_lo) * _mag_lo
+                    _dq_hi = (1 - 2 * _sign_hi) * _mag_hi
+                    _dq = torch.zeros(
+                        16, device=key_cache.device)
+                    _dq[0::2] = _dq_lo
+                    _dq[1::2] = _dq_hi
+                    _slot_e8m0 = int(
+                        k_samp[_ti].item())
+                    _scale = 2.0 ** (
+                        _slot_e8m0 - 127)
+                    _dq_scaled = _dq * _scale
+                    _err = (_orig_h0 - _dq_scaled).abs()
+                    logger.info(
+                        "MXFP4 roundtrip tok=%d "
+                        "slot=%d h0: "
+                        "e8m0=%d scale=%.4f "
+                        "cache_bytes=%s "
+                        "orig[:4]=%.3f,%.3f,%.3f,%.3f "
+                        "dq[:4]=%.3f,%.3f,%.3f,%.3f "
+                        "max_err=%.4f mean_err=%.4f",
+                        int(valid_indices[
+                            _ti].item()),
+                        int(_rt_slot[_ti].item()),
+                        _slot_e8m0, _scale,
+                        _cached_bytes[:4].tolist(),
+                        _orig_h0[0].item(),
+                        _orig_h0[1].item(),
+                        _orig_h0[2].item(),
+                        _orig_h0[3].item(),
+                        _dq_scaled[0].item(),
+                        _dq_scaled[1].item(),
+                        _dq_scaled[2].item(),
+                        _dq_scaled[3].item(),
+                        _err.max().item(),
+                        _err.mean().item(),
+                    )
+            if _n_rt > 0:
+                _v_orig = cache_value[
+                    valid_indices[:_n_rt]].float()
+                for _ti in range(_n_rt):
+                    _b = int(_bi[_ti].item())
+                    _o = int(_bo[_ti].item())
+                    _v_cached_bytes = value_cache[
+                        _b, _o, 0, :8].clone()
+                    _v_orig_h0 = _v_orig[_ti, 0, :16]
+                    _v_lo = _v_cached_bytes & 0xF
+                    _v_hi = (_v_cached_bytes >> 4) & 0xF
+                    _v_sign_lo = ((_v_lo >> 3) & 1).float()
+                    _v_mag_lo = _FP4_LUT[
+                        (_v_lo & 7).long()]
+                    _v_sign_hi = ((_v_hi >> 3) & 1).float()
+                    _v_mag_hi = _FP4_LUT[
+                        (_v_hi & 7).long()]
+                    _v_dq_lo = (
+                        1 - 2 * _v_sign_lo) * _v_mag_lo
+                    _v_dq_hi = (
+                        1 - 2 * _v_sign_hi) * _v_mag_hi
+                    _v_dq = torch.zeros(
+                        16, device=value_cache.device)
+                    _v_dq[0::2] = _v_dq_lo
+                    _v_dq[1::2] = _v_dq_hi
+                    _v_slot_e8m0 = int(
+                        v_samp[_ti].item())
+                    _v_scale = 2.0 ** (
+                        _v_slot_e8m0 - 127)
+                    _v_dq_scaled = _v_dq * _v_scale
+                    _v_err = (
+                        _v_orig_h0 - _v_dq_scaled).abs()
+                    logger.info(
+                        "MXFP4 V roundtrip tok=%d "
+                        "slot=%d h0: "
+                        "e8m0=%d scale=%.6f "
+                        "cache_bytes=%s "
+                        "orig[:4]=%.5f,%.5f,%.5f,%.5f "
+                        "dq[:4]=%.5f,%.5f,%.5f,%.5f "
+                        "max_err=%.6f mean_err=%.6f",
+                        int(valid_indices[
+                            _ti].item()),
+                        int(_rt_slot[_ti].item()),
+                        _v_slot_e8m0, _v_scale,
+                        _v_cached_bytes[:4].tolist(),
+                        _v_orig_h0[0].item(),
+                        _v_orig_h0[1].item(),
+                        _v_orig_h0[2].item(),
+                        _v_orig_h0[3].item(),
+                        _v_dq_scaled[0].item(),
+                        _v_dq_scaled[1].item(),
+                        _v_dq_scaled[2].item(),
+                        _v_dq_scaled[3].item(),
+                        _v_err.max().item(),
+                        _v_err.mean().item(),
+                    )
+        except Exception as _e:
+            logger.warning(
+                "MXFP4 post-write verify failed: %s", _e)
+
+
+def _fp4_default_python_write(
+    cache_key: torch.Tensor,
+    cache_value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    k_scales_2d: torch.Tensor,
+    v_scales_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    head_size: int,
+):
+    """Pure-Python fallback for the DEFAULT FP4 per-block-32 write path.
+
+    This mirrors the C++ reshape_and_cache_flash_fp4_pertoken_quant_kernel
+    but runs entirely in PyTorch.  Used when the C++ kernel is not compiled.
+    Scales are float32, stored directly (no FP8 conversion).
+    """
+    FP4_MAX = 6.0
+    BLOCK_SIZE = FP4_QUANT_BLOCK_SIZE
+
+    valid_mask = slot_mapping >= 0
+    if not valid_mask.any():
+        return
+
+    valid_indices = torch.where(valid_mask)[0]
+    valid_slots = slot_mapping[valid_mask]
+    V = valid_indices.size(0)
+
+    _, num_heads, hs = cache_key.shape
+    num_blocks = max(1, hs // BLOCK_SIZE)
+    half_head = hs // 2
+    cache_block_size = key_cache.size(1)
+    total_tokens = k_scales_2d.size(1)
+
+    for src, dst_cache, s_2d in [
+        (cache_key, key_cache, k_scales_2d),
+        (cache_value, value_cache, v_scales_2d),
+    ]:
+        vals = src[valid_indices].float()
+
+        if num_blocks > 1:
+            vals_blk = vals.view(V, num_heads, num_blocks, BLOCK_SIZE)
+            absmax = vals_blk.abs().amax(dim=-1)
+            scales = torch.clamp(absmax / FP4_MAX, min=1e-3)
+            scales_inv = 1.0 / scales
+            normalized = vals_blk * scales_inv.unsqueeze(-1)
+        else:
+            absmax = vals.abs().amax(dim=-1, keepdim=True)
+            scales = torch.clamp(absmax / FP4_MAX, min=1e-3)
+            scales_inv = 1.0 / scales
+            normalized = vals * scales_inv
+            normalized = normalized.unsqueeze(2)
+
+        fp4_nibbles = _fp4_e2m1_quantize_tensor(normalized)
+        fp4_flat = fp4_nibbles.reshape(V, num_heads, -1)
+        fp4_lo = fp4_flat[:, :, 0::2]
+        fp4_hi = fp4_flat[:, :, 1::2]
+        fp4_packed = (fp4_lo & 0xF) | ((fp4_hi & 0xF) << 4)
+        fp4_packed = fp4_packed.reshape(V, num_heads, half_head)
+
+        block_idx = valid_slots // cache_block_size
+        block_off = valid_slots % cache_block_size
+        for i in range(V):
+            bi = block_idx[i].item()
+            bo = block_off[i].item()
+            dst_cache[bi, bo, :, :] = fp4_packed[i].to(torch.uint8)
+
+        scales_flat = scales.view(V, num_heads * num_blocks)
+        stride_h = num_blocks * total_tokens
+        hb = torch.arange(num_heads * num_blocks, device=src.device)
+        h_idx = hb // num_blocks
+        b_idx = hb % num_blocks
+        base = h_idx * stride_h + b_idx * total_tokens
+        flat_idx = base.unsqueeze(0) + valid_slots.unsqueeze(1)
+        s_2d.view(-1).scatter_(
+            0, flat_idx.reshape(-1), scales_flat.reshape(-1))
+
+
+def _nvfp4_write_cache(
+    cache_key, cache_value,
+    key_cache, value_cache,
+    k_fp8_2d, v_fp8_2d,
+    layer, num_kv_heads, total_tokens, head_size,
+    slot_mapping, kv_cache_dtype,
+):
+    """Write FP4 cache with NVFP4 FP8-E4M3 scales.
+
+    Three-tier fallback strategy:
+      1. Native C++ NVFP4 kernel (writes FP4 data + FP8 scales directly)
+      2. Float32 per-token C++ kernel + Python FP8 conversion
+      3. Pure Python FP4 quantization + FP8 scale computation
+
+    Each tier validates the output at written slot positions.  If a tier
+    produces all-zero FP8 bytes, the next tier is tried automatically.
+    The native C++ kernel must pass validation on N consecutive calls
+    before it is trusted without further checks.
+    """
+    global _NVFP4_WRITE_DIAGNOSED, _NVFP4_HAS_DIRECT_OP
+    global _NVFP4_HAS_PERTOKEN_OP
+    global _NVFP4_NATIVE_VALIDATED, _NVFP4_USING_PYTHON_FALLBACK
+    global _NVFP4_NATIVE_VALIDATION_PASSES
+    need_diag = not _NVFP4_WRITE_DIAGNOSED
+
+    valid_mask = slot_mapping >= 0
+    valid_slots = int(valid_mask.sum().item())
+
+    if valid_slots > 0:
+        layer._fp4_nvfp4_write_count = getattr(
+            layer, "_fp4_nvfp4_write_count", 0) + 1
+
+    # Skip if we already know only Python works
+    if _NVFP4_USING_PYTHON_FALLBACK:
+        _nvfp4_write_cache_python(
+            cache_key, cache_value, key_cache, value_cache,
+            k_fp8_2d, v_fp8_2d, slot_mapping, total_tokens,
         )
-        _FP4_NVFP4 = False
+        if valid_slots > 0:
+            layer._fp4_nvfp4_scales_verified = True
+        return
+
+    # ---- Tier 1: native C++ NVFP4 kernel -------------------------------- #
+    if _NVFP4_HAS_DIRECT_OP:
+        try:
+            torch.ops._C_cache_ops.reshape_and_cache_flash_fp4_nvfp4(
+                cache_key, cache_value, key_cache, value_cache,
+                k_fp8_2d, v_fp8_2d, slot_mapping, kv_cache_dtype,
+            )
+            if valid_slots == 0:
+                if need_diag:
+                    _NVFP4_WRITE_DIAGNOSED = True
+                    logger.info(
+                        "NVFP4 write diag: native kernel called with "
+                        "valid_slots=0 (warmup/profiling step).")
+                return
+
+            needs_validation = (
+                not _NVFP4_NATIVE_VALIDATED or need_diag)
+            if needs_validation:
+                torch.cuda.current_stream(
+                    key_cache.device).synchronize()
+                valid_slot_indices = slot_mapping[valid_mask][:32]
+                num_blk = max(1, head_size // FP4_QUANT_BLOCK_SIZE)
+                multi_row_offsets = torch.arange(
+                    min(4, num_kv_heads * num_blk),
+                    device=key_cache.device,
+                    dtype=torch.int64,
+                ) * total_tokens
+                multi_check = (
+                    multi_row_offsets.unsqueeze(1)
+                    + valid_slot_indices.unsqueeze(0)
+                ).reshape(-1)
+                multi_check = multi_check.clamp(
+                    max=k_fp8_2d.numel() - 1)
+                k_sampled = k_fp8_2d.view(-1)[multi_check]
+                k_nz_sampled = int(
+                    k_sampled.count_nonzero().item())
+
+                if need_diag:
+                    k_nz_total = int(
+                        k_fp8_2d.count_nonzero().item())
+                    v_nz_total = int(
+                        v_fp8_2d.count_nonzero().item())
+                    logger.info(
+                        "NVFP4 write diag (native): "
+                        "valid_slots=%d, "
+                        "sampled_nz=%d/%d (multi-row), "
+                        "k_total_nz=%d, v_total_nz=%d, "
+                        "buf_numel=%d, pass_count=%d/%d",
+                        valid_slots, k_nz_sampled,
+                        len(multi_check),
+                        k_nz_total, v_nz_total,
+                        k_fp8_2d.numel(),
+                        _NVFP4_NATIVE_VALIDATION_PASSES,
+                        _NVFP4_NATIVE_VALIDATION_REQUIRED)
+                    _NVFP4_WRITE_DIAGNOSED = True
+
+                if k_nz_sampled > 0:
+                    _NVFP4_NATIVE_VALIDATION_PASSES += 1
+                    if _NVFP4_NATIVE_VALIDATION_PASSES >= \
+                            _NVFP4_NATIVE_VALIDATION_REQUIRED:
+                        _NVFP4_NATIVE_VALIDATED = True
+                        logger.info(
+                            "NVFP4: native kernel validated "
+                            "after %d consecutive passes.",
+                            _NVFP4_NATIVE_VALIDATION_PASSES)
+                    layer._fp4_nvfp4_scales_verified = True
+                    return
+
+                logger.warning(
+                    "NVFP4 native kernel wrote FP8 byte 0 at "
+                    "all %d sampled positions (pass %d); "
+                    "trying float32 fallback.",
+                    len(multi_check),
+                    _NVFP4_NATIVE_VALIDATION_PASSES)
+                _NVFP4_NATIVE_VALIDATION_PASSES = 0
+                _NVFP4_HAS_DIRECT_OP = False
+            else:
+                layer._fp4_nvfp4_scales_verified = True
+                return
+        except RuntimeError as err:
+            logger.warning(
+                "NVFP4 native kernel raised RuntimeError (%s); "
+                "trying float32 fallback.", err)
+            _NVFP4_HAS_DIRECT_OP = False
+
+    # ---- Tier 2: float32 pertoken C++ kernel + Python FP8 conversion ---- #
+    tier2_ok = False
+    if _NVFP4_HAS_PERTOKEN_OP:
+        try:
+            (_, _, k_f32_2d, v_f32_2d) = \
+                _get_or_create_fp4_pertoken_scales(
+                    layer, num_kv_heads, total_tokens,
+                    key_cache.device, head_size,
+                )
+            torch.ops._C_cache_ops \
+                .reshape_and_cache_flash_with_pertoken_quant(
+                    cache_key, cache_value, key_cache, value_cache,
+                    k_f32_2d, v_f32_2d, slot_mapping, kv_cache_dtype,
+                )
+            k_fp8_2d.copy_(_float_to_fp8_e4m3(k_f32_2d))
+            v_fp8_2d.copy_(_float_to_fp8_e4m3(v_f32_2d))
+            tier2_ok = True
+        except RuntimeError as err:
+            logger.warning(
+                "NVFP4 pertoken fallback raised RuntimeError "
+                "(%s); falling back to pure Python.", err)
+            _NVFP4_HAS_PERTOKEN_OP = False
+
+    if tier2_ok and valid_slots > 0:
+        torch.cuda.current_stream(key_cache.device).synchronize()
+        valid_slot_indices = slot_mapping[valid_mask][:32]
+        k_nz_sampled = int(
+            k_fp8_2d.view(-1)[valid_slot_indices]
+            .count_nonzero().item())
+        if need_diag:
+            k_f32_nz = int((k_f32_2d > 0).sum().item())
+            v_f32_nz = int((v_f32_2d > 0).sum().item())
+            k_nz = int(k_fp8_2d.count_nonzero().item())
+            v_nz = int(v_fp8_2d.count_nonzero().item())
+            logger.info(
+                "NVFP4 write diag (tier2-fallback): "
+                "valid_slots=%d, "
+                "f32 k_nz=%d v_nz=%d, fp8 k_nz=%d v_nz=%d, "
+                "sampled_nz=%d/%d (total_buf=%d)",
+                valid_slots, k_f32_nz, v_f32_nz, k_nz, v_nz,
+                k_nz_sampled, len(valid_slot_indices),
+                k_fp8_2d.numel())
+            _NVFP4_WRITE_DIAGNOSED = True
+        if k_nz_sampled > 0:
+            layer._fp4_nvfp4_scales_verified = True
+            return
+        logger.warning(
+            "NVFP4 tier2 fallback produced zero FP8 at all "
+            "%d sampled slots; using pure Python.",
+            len(valid_slot_indices))
+    elif tier2_ok:
+        if need_diag:
+            _NVFP4_WRITE_DIAGNOSED = True
+            logger.info(
+                "NVFP4 write diag (tier2): "
+                "valid_slots=0 (warmup).")
+        return
+
+    # ---- Tier 3: pure Python FP4 quantization + FP8 scales ----------- #
+    if not _NVFP4_USING_PYTHON_FALLBACK:
+        logger.warning(
+            "NVFP4: using pure Python FP4 quantization "
+            "(slower). Rebuild vLLM with the updated "
+            "cache_kernels.cu for full performance.")
+    _NVFP4_USING_PYTHON_FALLBACK = True
+    _nvfp4_write_cache_python(
+        cache_key, cache_value, key_cache, value_cache,
+        k_fp8_2d, v_fp8_2d, slot_mapping, total_tokens,
+    )
+    if valid_slots > 0:
+        layer._fp4_nvfp4_scales_verified = True
+        if need_diag:
+            torch.cuda.current_stream(
+                key_cache.device).synchronize()
+            valid_slot_indices = slot_mapping[valid_mask][:32]
+            k_nz_sampled = int(
+                k_fp8_2d.view(-1)[valid_slot_indices]
+                .count_nonzero().item())
+            logger.info(
+                "NVFP4 write diag (tier3-python): "
+                "valid_slots=%d, sampled_nz=%d/%d",
+                valid_slots, k_nz_sampled,
+                len(valid_slot_indices))
+            _NVFP4_WRITE_DIAGNOSED = True
+
 
 # Per-channel K scale accuracy tuning.
 # Clip sigma: use min(absmax, rms * sigma) per channel to reduce outlier
@@ -440,11 +1157,13 @@ def _get_or_create_fp4_mxfp4_scales(
     num_blocks = max(1, head_size // FP4_QUANT_BLOCK_SIZE)
 
     k_flat_size = num_kv_heads * num_blocks * total_tokens
-    k_flat = torch.zeros(k_flat_size, dtype=torch.uint8, device=device)
+    k_flat = torch.full(
+        (k_flat_size,), 127, dtype=torch.uint8, device=device)
     k_2d = k_flat.view(num_kv_heads * num_blocks, total_tokens)
 
     v_flat_size = num_kv_heads * num_blocks * total_tokens
-    v_flat = torch.zeros(v_flat_size, dtype=torch.uint8, device=device)
+    v_flat = torch.full(
+        (v_flat_size,), 127, dtype=torch.uint8, device=device)
     v_2d = v_flat.view(num_kv_heads * num_blocks, total_tokens)
 
     layer._fp4_mxfp4_k_scales_flat = k_flat
@@ -478,6 +1197,85 @@ def _fp8_e4m3_to_float(raw: torch.Tensor) -> torch.Tensor:
     return result
 
 
+_FP8_E4M3_BOUNDARIES = None  # lazily built on first use
+
+
+def _get_fp8_e4m3_boundaries(device):
+    """Build (once per device) the midpoint boundary table for FP8 E4M3 FNUZ.
+
+    FP8 E4M3 FNUZ has 128 non-negative encodings (bytes 0..127).  We
+    pre-compute the float32 value of each, then build 127 midpoints between
+    consecutive representable values.  ``torch.bucketize`` on these
+    midpoints yields the nearest FP8 byte — using **only comparisons**,
+    no log/pow/view-as-int, so it works on every GPU driver.
+    """
+    global _FP8_E4M3_BOUNDARIES
+    if _FP8_E4M3_BOUNDARIES is not None:
+        cached_boundaries, cached_device = _FP8_E4M3_BOUNDARIES
+        if cached_device == device:
+            return cached_boundaries
+        return cached_boundaries.to(device=device, non_blocking=True)
+
+    fp8_vals = []
+    for byte_val in range(128):
+        exp_bits = (byte_val >> 3) & 0xF
+        mantissa = byte_val & 0x7
+        if byte_val == 0:
+            fp8_vals.append(0.0)
+        elif exp_bits == 0:
+            fp8_vals.append((2.0 ** -7.0) * (mantissa / 8.0))
+        else:
+            fp8_vals.append(
+                (2.0 ** (exp_bits - 8)) * (1.0 + mantissa / 8.0))
+
+    midpoints = []
+    for i in range(127):
+        midpoints.append((fp8_vals[i] + fp8_vals[i + 1]) / 2.0)
+
+    boundaries = torch.tensor(
+        midpoints, dtype=torch.float32, device=device)
+    _FP8_E4M3_BOUNDARIES = (boundaries, device)
+    return boundaries
+
+
+# FP8 E4M3 FNUZ positive encoding: byte 0 = 0.0, byte 1 = 2^(-10) ≈ 9.77e-4.
+# Round-to-nearest boundary between byte 0 and byte 1 = 9.77e-4 / 2 ≈ 4.88e-4.
+# Any positive scale value below this threshold encodes as byte 0, which
+# makes fp8_e4m3_to_float_pa() return 0.0 in the PA kernel, silently
+# dequantizing all K/V values in that block as 0 — corrupting attention.
+_FP8_E4M3_NONZERO_THRESHOLD: float = 5e-4  # safely > 4.88e-4
+
+
+def _float_to_fp8_e4m3(x: torch.Tensor) -> torch.Tensor:
+    """Convert positive float32 values to FP8 E4M3 FNUZ uint8 encoding.
+
+    Uses ``torch.bucketize`` with a pre-computed midpoint table of all
+    128 non-negative FP8 E4M3 FNUZ values.  This approach uses **only
+    comparison operations** — no ``torch.log2``, ``torch.pow``,
+    ``torch.float8_e4m3fnuz``, or ``Tensor.view(torch.int32)``, all of
+    which can silently produce incorrect results on certain ROCm builds.
+
+    The midpoint table has 127 entries; ``bucketize`` returns the bucket
+    index which directly equals the FP8 byte value (round-to-nearest).
+
+    Critical: positive values below ``_FP8_E4M3_NONZERO_THRESHOLD`` are
+    raised to that threshold so they always encode as byte >= 1.  True
+    zeros (unwritten scale slots in the buffer) are preserved as 0 → byte 0.
+    """
+    boundaries = _get_fp8_e4m3_boundaries(x.device)
+    x_f32 = x.float().clamp(max=240.0)
+    # Raise positive values that are too small to encode as a non-zero FP8
+    # byte.  This ensures the PA kernel's fp8_e4m3_to_float_pa() returns a
+    # positive scale, not 0.0, which would make every K/V element in the
+    # block dequantize to zero and corrupt attention scores.
+    x_f32 = x_f32.masked_fill(
+        (x_f32 > 0.0) & (x_f32 < _FP8_E4M3_NONZERO_THRESHOLD),
+        _FP8_E4M3_NONZERO_THRESHOLD,
+    )
+    result = torch.bucketize(x_f32.contiguous(), boundaries)
+    return result.to(torch.uint8)
+
+
 def _get_or_create_fp4_nvfp4_scales(
     layer: torch.nn.Module,
     num_kv_heads: int,
@@ -502,12 +1300,17 @@ def _get_or_create_fp4_nvfp4_scales(
 
     num_blocks = max(1, head_size // FP4_QUANT_BLOCK_SIZE)
 
+    _NVFP4_SCALE_ONE_BYTE = 64
     k_flat_size = num_kv_heads * num_blocks * total_tokens
-    k_flat = torch.zeros(k_flat_size, dtype=torch.uint8, device=device)
+    k_flat = torch.full(
+        (k_flat_size,), _NVFP4_SCALE_ONE_BYTE,
+        dtype=torch.uint8, device=device)
     k_2d = k_flat.view(num_kv_heads * num_blocks, total_tokens)
 
     v_flat_size = num_kv_heads * num_blocks * total_tokens
-    v_flat = torch.zeros(v_flat_size, dtype=torch.uint8, device=device)
+    v_flat = torch.full(
+        (v_flat_size,), _NVFP4_SCALE_ONE_BYTE,
+        dtype=torch.uint8, device=device)
     v_2d = v_flat.view(num_kv_heads * num_blocks, total_tokens)
 
     layer._fp4_nvfp4_k_scales_flat = k_flat
@@ -519,6 +1322,8 @@ def _get_or_create_fp4_nvfp4_scales(
     layer._fp4_k_scale_stride_h = num_blocks * total_tokens
     layer._fp4_v_scale_stride_h = num_blocks * total_tokens
     layer._fp4_nvfp4_active = True
+    layer._fp4_nvfp4_write_count = 0
+    layer._fp4_nvfp4_scales_verified = False
 
     return k_flat, v_flat, k_2d, v_2d
 
@@ -552,8 +1357,9 @@ def _get_or_create_fp4_amxfp4_scales(
 
     num_blocks = max(1, head_size // FP4_QUANT_BLOCK_SIZE)
 
-    k_scale_flat = torch.zeros(
-        num_kv_heads * num_blocks * total_tokens,
+    _E8M0_ONE = 127
+    k_scale_flat = torch.full(
+        (num_kv_heads * num_blocks * total_tokens,), _E8M0_ONE,
         dtype=torch.uint8, device=device)
     k_scales_2d = k_scale_flat.view(num_kv_heads * num_blocks, total_tokens)
 
@@ -562,8 +1368,8 @@ def _get_or_create_fp4_amxfp4_scales(
         dtype=torch.uint8, device=device)
     k_bm_2d = k_bm_flat.view(num_kv_heads * num_blocks, total_tokens)
 
-    v_scale_flat = torch.zeros(
-        num_kv_heads * num_blocks * total_tokens,
+    v_scale_flat = torch.full(
+        (num_kv_heads * num_blocks * total_tokens,), _E8M0_ONE,
         dtype=torch.uint8, device=device)
     v_scales_2d = v_scale_flat.view(num_kv_heads * num_blocks, total_tokens)
 
@@ -575,9 +1381,11 @@ def _get_or_create_fp4_amxfp4_scales(
     k_packed = torch.zeros(
         num_kv_heads * num_blocks * 2, total_tokens,
         dtype=torch.uint8, device=device)
+    k_packed[:num_kv_heads * num_blocks, :] = _E8M0_ONE
     v_packed = torch.zeros(
         num_kv_heads * num_blocks * 2, total_tokens,
         dtype=torch.uint8, device=device)
+    v_packed[:num_kv_heads * num_blocks, :] = _E8M0_ONE
 
     layer._fp4_amxfp4_k_scales_2d = k_scales_2d
     layer._fp4_amxfp4_v_scales_2d = v_scales_2d
@@ -1136,9 +1944,6 @@ if current_platform.is_rocm():
             BLOCK_SIZE=head_size,
             QUANT=QUANT,
         )
-
-
-logger = init_logger(__name__)
 
 
 @dataclass
@@ -1827,9 +2632,36 @@ class AiterFlashAttentionImpl(AttentionImpl):
             ):
                 _ensure_amxfp4_op_available()
                 _ensure_nvfp4_op_available()
+                _ensure_mxfp4_op_available()
                 num_kv_heads = key_cache.size(2)
                 total_tokens = key_cache.size(0) * key_cache.size(1)
                 head_size = key.shape[-1]
+
+                global _FP4_BRANCH_LOGGED
+                if not _FP4_BRANCH_LOGGED:
+                    _FP4_BRANCH_LOGGED = True
+                    _br = (
+                        "AMXFP4" if _FP4_AMXFP4 else
+                        "NVFP4" if _FP4_NVFP4 else
+                        "MXFP4" if _FP4_MXFP4 else
+                        "PER_CHANNEL_K"
+                        if _FP4_PER_CHANNEL_K else
+                        "DEFAULT")
+                    logger.info(
+                        "FP4 WRITE branch=%s "
+                        "MXFP4=%s NVFP4=%s AMXFP4=%s "
+                        "PCK=%s "
+                        "VLLM_FP4_MXFP4=%s "
+                        "num_kv_heads=%d total_tokens=%d "
+                        "head_size=%d",
+                        _br,
+                        _FP4_MXFP4, _FP4_NVFP4,
+                        _FP4_AMXFP4, _FP4_PER_CHANNEL_K,
+                        os.environ.get(
+                            "VLLM_FP4_MXFP4", "(not set)"),
+                        num_kv_heads, total_tokens,
+                        head_size,
+                    )
 
                 cache_key = key
                 cache_value = value
@@ -1877,17 +2709,15 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         layer, num_kv_heads, total_tokens,
                         key_cache.device, head_size,
                     )
-                    torch.ops._C_cache_ops \
-                        .reshape_and_cache_flash_fp4_nvfp4(
-                            cache_key,
-                            cache_value,
-                            key_cache,
-                            value_cache,
-                            k_fp8_2d,
-                            v_fp8_2d,
-                            attn_metadata.slot_mapping,
-                            self.kv_cache_dtype,
-                        )
+                    _nvfp4_write_cache(
+                        cache_key, cache_value,
+                        key_cache, value_cache,
+                        k_fp8_2d, v_fp8_2d,
+                        layer, num_kv_heads, total_tokens,
+                        head_size,
+                        attn_metadata.slot_mapping,
+                        self.kv_cache_dtype,
+                    )
                 elif _FP4_MXFP4:
                     (
                         k_e8m0_flat, v_e8m0_flat, k_e8m0_2d, v_e8m0_2d,
@@ -1895,16 +2725,106 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         layer, num_kv_heads, total_tokens,
                         key_cache.device, head_size,
                     )
-                    torch.ops._C_cache_ops \
-                        .reshape_and_cache_flash_fp4_mxfp4(
-                            cache_key,
-                            cache_value,
-                            key_cache,
-                            value_cache,
-                            k_e8m0_2d,
-                            v_e8m0_2d,
+                    global _MXFP4_WRITE_DIAGNOSED
+                    global _MXFP4_KERNEL_VALIDATED
+                    global _MXFP4_USE_PYTHON_FALLBACK
+                    if not _MXFP4_WRITE_DIAGNOSED:
+                        _MXFP4_WRITE_DIAGNOSED = True
+                        _path = ("Python (default, safe)"
+                                 if _MXFP4_USE_PYTHON_FALLBACK
+                                 else "C++ (VLLM_FP4_MXFP4_CPP=1)")
+                        logger.info(
+                            "MXFP4 write path first call: "
+                            "mode=%s "
+                            "k_e8m0 shape=%s "
+                            "num_tokens=%d total_slots=%d "
+                            "head_size=%d num_kv_heads=%d "
+                            "(set VLLM_FP4_MXFP4_CPP=1 to try "
+                            "C++ kernel after rebuild)",
+                            _path,
+                            list(k_e8m0_2d.shape),
+                            cache_key.shape[0], total_tokens,
+                            head_size, num_kv_heads,
+                        )
+                    _use_python = _MXFP4_USE_PYTHON_FALLBACK
+                    if not _use_python:
+                        try:
+                            torch.ops._C_cache_ops \
+                                .reshape_and_cache_flash_fp4_mxfp4(
+                                    cache_key,
+                                    cache_value,
+                                    key_cache,
+                                    value_cache,
+                                    k_e8m0_2d,
+                                    v_e8m0_2d,
+                                    attn_metadata.slot_mapping,
+                                    self.kv_cache_dtype,
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "MXFP4 C++ kernel failed: %s. "
+                                "Switching to Python fallback "
+                                "permanently.", e)
+                            _MXFP4_USE_PYTHON_FALLBACK = True
+                            _use_python = True
+
+                        if not _use_python and \
+                                not _MXFP4_KERNEL_VALIDATED:
+                            valid_slots = attn_metadata.slot_mapping[
+                                attn_metadata.slot_mapping >= 0]
+                            if valid_slots.numel() > 0:
+                                torch.cuda.current_stream(
+                                    key_cache.device
+                                ).synchronize()
+                                sample = k_e8m0_2d[
+                                    0, valid_slots[:min(
+                                        32, valid_slots.numel()
+                                    )]]
+                                nz = int(
+                                    sample.count_nonzero().item())
+                                n_unique = int(
+                                    sample.unique().numel())
+                                _bad = False
+                                if nz == 0:
+                                    _bad = True
+                                    _reason = (
+                                        "ALL ZERO E8M0 bytes")
+                                elif n_unique == 1:
+                                    _bad = True
+                                    _reason = (
+                                        "ALL SAME byte=%d "
+                                        "(kernel likely wrote "
+                                        "constant due to broken "
+                                        "log2f/roundf)"
+                                        % sample[0].item())
+                                if not _bad:
+                                    _MXFP4_KERNEL_VALIDATED = True
+                                    logger.info(
+                                        "MXFP4 C++ kernel "
+                                        "validated: %d/%d "
+                                        "nonzero, %d unique "
+                                        "E8M0 bytes.",
+                                        nz, sample.numel(),
+                                        n_unique)
+                                else:
+                                    logger.error(
+                                        "MXFP4 C++ kernel: "
+                                        "%s (%d samples). "
+                                        "Switching to Python "
+                                        "fallback permanently.",
+                                        _reason,
+                                        sample.numel())
+                                    _MXFP4_USE_PYTHON_FALLBACK = \
+                                        True
+                                    _use_python = True
+
+                    if _use_python:
+                        _mxfp4_write_cache_python(
+                            cache_key, cache_value,
+                            key_cache, value_cache,
+                            k_e8m0_2d, v_e8m0_2d,
                             attn_metadata.slot_mapping,
-                            self.kv_cache_dtype,
+                            total_tokens,
                         )
                 elif _FP4_PER_CHANNEL_K:
                     (
@@ -1941,16 +2861,61 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         layer, num_kv_heads, total_tokens,
                         key_cache.device, head_size,
                     )
-                    torch.ops._C_cache_ops \
-                        .reshape_and_cache_flash_with_pertoken_quant(
-                            cache_key,
-                            cache_value,
-                            key_cache,
-                            value_cache,
-                            k_2d,
-                            v_2d,
+                    global _FP4_WRITE_MODE_LOGGED
+                    if not _FP4_WRITE_MODE_LOGGED:
+                        _FP4_WRITE_MODE_LOGGED = True
+                        logger.info(
+                            "FP4 DEFAULT write path: "
+                            "k_scale dtype=%s shape=%s "
+                            "v_scale dtype=%s shape=%s "
+                            "num_tokens=%d head_size=%d",
+                            k_2d.dtype, list(k_2d.shape),
+                            v_2d.dtype, list(v_2d.shape),
+                            cache_key.shape[0], head_size,
+                        )
+                    _default_use_python = False
+                    try:
+                        torch.ops._C_cache_ops \
+                            .reshape_and_cache_flash_with_pertoken_quant(
+                                cache_key,
+                                cache_value,
+                                key_cache,
+                                value_cache,
+                                k_2d,
+                                v_2d,
+                                attn_metadata.slot_mapping,
+                                self.kv_cache_dtype,
+                            )
+                        valid_slots = attn_metadata.slot_mapping[
+                            attn_metadata.slot_mapping >= 0]
+                        if valid_slots.numel() > 0:
+                            torch.cuda.current_stream(
+                                key_cache.device
+                            ).synchronize()
+                            sample = k_2d[
+                                0, valid_slots[:min(
+                                    32, valid_slots.numel()
+                                )]]
+                            if sample.abs().sum().item() == 0:
+                                logger.warning(
+                                    "Default FP4 C++ write "
+                                    "kernel produced all-zero "
+                                    "scales (%d samples). "
+                                    "Falling back to Python.",
+                                    sample.numel())
+                                _default_use_python = True
+                    except Exception as e:
+                        logger.warning(
+                            "Default FP4 C++ write kernel failed: "
+                            "%s. Using Python fallback.", e)
+                        _default_use_python = True
+                    if _default_use_python:
+                        _fp4_default_python_write(
+                            cache_key, cache_value,
+                            key_cache, value_cache,
+                            k_2d, v_2d,
                             attn_metadata.slot_mapping,
-                            self.kv_cache_dtype,
+                            head_size,
                         )
             elif USING_SHUFFLE_LAYOUT:
                 num_blocks, block_size, num_kv_heads, head_size = \
@@ -2218,13 +3183,15 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             fp4_num_v_blocks = \
                                 -(num_v_blks + _AMXFP4_SIGNAL_OFFSET)
                         elif _FP4_NVFP4 and hasattr(
-                            layer, "_fp4_nvfp4_k_scales_flat"
+                            layer, "_fp4_nvfp4_k_scales_2d"
                         ):
                             fp4_nvfp4_active = True
                             k_scale_for_pa = \
-                                layer._fp4_nvfp4_k_scales_flat
+                                layer._fp4_nvfp4_k_scales_2d \
+                                    .contiguous().view(-1)
                             v_scale_for_pa = \
-                                layer._fp4_nvfp4_v_scales_flat
+                                layer._fp4_nvfp4_v_scales_2d \
+                                    .contiguous().view(-1)
                             k_scale_stride_h = \
                                 layer._fp4_k_scale_stride_h
                             v_scale_stride_h = \
@@ -2315,6 +3282,268 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             decode_q.float() * k_ch_q.unsqueeze(0)
                         ).to(decode_q.dtype)
 
+                    # --- Universal FP4 decode-time diagnostic + self-healing ---
+                    # One-time per-layer check on first decode: log mode,
+                    # validate scales, and fix zero-byte positions.
+                    if not getattr(
+                        layer, "_fp4_decode_validated", False
+                    ):
+                        layer._fp4_decode_validated = True
+                        torch.cuda.current_stream(
+                            output.device).synchronize()
+
+                        _mode = (
+                            "AMXFP4" if fp4_amxfp4_active else
+                            "NVFP4" if fp4_nvfp4_active else
+                            "MXFP4" if fp4_mxfp4_active else
+                            "PER_CHANNEL_K"
+                            if fp4_per_channel_k_active else
+                            "DEFAULT"
+                        )
+                        _is_uint8 = (
+                            k_scale_for_pa.dtype == torch.uint8)
+                        _k_nz = int(
+                            k_scale_for_pa.count_nonzero().item())
+                        _v_nz = int(
+                            v_scale_for_pa.count_nonzero().item())
+                        _k_zeros = k_scale_for_pa.numel() - _k_nz
+                        _v_zeros = v_scale_for_pa.numel() - _v_nz
+
+                        global _FP4_DECODE_MODE_LOGGED
+                        if not _FP4_DECODE_MODE_LOGGED:
+                            _FP4_DECODE_MODE_LOGGED = True
+                            logger.info(
+                                "FP4 decode diag: "
+                                "mode=%s k_dtype=%s k_shape=%s "
+                                "k_nz=%d/%d k_zeros=%d "
+                                "v_dtype=%s v_nz=%d/%d "
+                                "stride_h=%d num_k_blks=%d "
+                                "num_v_blks=%d "
+                                "env: NVFP4=%s MXFP4=%s "
+                                "AMXFP4=%s PCK=%s",
+                                _mode,
+                                k_scale_for_pa.dtype,
+                                list(k_scale_for_pa.shape),
+                                _k_nz, k_scale_for_pa.numel(),
+                                _k_zeros,
+                                v_scale_for_pa.dtype,
+                                _v_nz, v_scale_for_pa.numel(),
+                                k_scale_stride_h,
+                                fp4_num_k_blocks,
+                                fp4_num_v_blocks,
+                                _FP4_NVFP4, _FP4_MXFP4,
+                                _FP4_AMXFP4, _FP4_PER_CHANNEL_K,
+                            )
+                            if _is_uint8 and \
+                                    fp4_mxfp4_active:
+                                try:
+                                    _bt = attn_metadata.block_table
+                                    _sl = attn_metadata.seq_lens
+                                    _bs = key_cache.size(1)
+                                    _cached_slots = []
+                                    for _si in range(
+                                            min(2, _bt.size(0))):
+                                        _ctx = int(
+                                            _sl[_si].item())
+                                        for _ti in range(
+                                                min(16, _ctx)):
+                                            _bi = int(
+                                                _bt[_si,
+                                                    _ti // _bs
+                                                    ].item())
+                                            _bo = _ti % _bs
+                                            _slot = _bi * _bs + _bo
+                                            _cached_slots.append(
+                                                _slot)
+                                    if _cached_slots:
+                                        _cs = torch.tensor(
+                                            _cached_slots,
+                                            device=k_scale_for_pa
+                                                .device,
+                                            dtype=torch.long)
+                                        _k_at = k_scale_for_pa[
+                                            _cs]
+                                        _k127 = int(
+                                            (_k_at == 127).sum()
+                                                .item())
+                                        _k_u = int(
+                                            _k_at.unique().numel())
+                                        logger.info(
+                                            "FP4 decode CACHED "
+                                            "slot sample (h0b0, "
+                                            "%d slots): "
+                                            "k_e8m0 min=%d max=%d "
+                                            "unique=%d n_127=%d "
+                                            "vals=%s",
+                                            len(_cached_slots),
+                                            int(_k_at.min()
+                                                .item()),
+                                            int(_k_at.max()
+                                                .item()),
+                                            _k_u, _k127,
+                                            _k_at[:8].tolist(),
+                                        )
+                                except Exception as _e:
+                                    logger.warning(
+                                        "FP4 decode cached-slot "
+                                        "sample failed: %s", _e)
+
+                        _k_needs_fix = False
+                        _v_needs_fix = False
+                        _k_all_same = False
+                        _v_all_same = False
+                        if _is_uint8:
+                            _k_uniq = int(
+                                k_scale_for_pa[:min(
+                                    4096, k_scale_for_pa.numel()
+                                )].unique().numel())
+                            _v_uniq = int(
+                                v_scale_for_pa[:min(
+                                    4096, v_scale_for_pa.numel()
+                                )].unique().numel())
+                            if _k_nz == 0:
+                                _k_needs_fix = True
+                            elif _k_uniq == 1:
+                                _k_const = int(
+                                    k_scale_for_pa[0].item())
+                                _init_val = (
+                                    127 if _mode in (
+                                        "MXFP4", "AMXFP4")
+                                    else 64 if _mode == "NVFP4"
+                                    else 0)
+                                if _k_const != _init_val:
+                                    _k_all_same = True
+                                    _k_needs_fix = True
+                                elif not _MXFP4_USE_PYTHON_FALLBACK:
+                                    _k_all_same = True
+                                    _k_needs_fix = True
+                            if _v_nz == 0:
+                                _v_needs_fix = True
+                            elif _v_uniq == 1:
+                                _v_const = int(
+                                    v_scale_for_pa[0].item())
+                                _init_v = (
+                                    127 if _mode in (
+                                        "MXFP4", "AMXFP4")
+                                    else 64 if _mode == "NVFP4"
+                                    else 0)
+                                if _v_const != _init_v:
+                                    _v_all_same = True
+                                    _v_needs_fix = True
+                                elif not _MXFP4_USE_PYTHON_FALLBACK:
+                                    _v_all_same = True
+                                    _v_needs_fix = True
+                        else:
+                            if _k_nz == 0:
+                                _k_needs_fix = True
+                            if _v_nz == 0:
+                                _v_needs_fix = True
+
+                        if _k_needs_fix:
+                            if _is_uint8:
+                                if _mode == "NVFP4":
+                                    _fill_val = 64
+                                    _desc = "FP8 byte=64 (1.0)"
+                                elif _mode in ("MXFP4", "AMXFP4"):
+                                    _fill_val = 127
+                                    _desc = "E8M0 byte=127 (1.0)"
+                                else:
+                                    _fill_val = 1
+                                    _desc = "byte=1"
+                                if _k_all_same:
+                                    _k_const = int(
+                                        k_scale_for_pa[0].item())
+                                    logger.error(
+                                        "FP4 CRITICAL [%s]: "
+                                        "k_scale ALL SAME "
+                                        "byte=%d (%d sampled, "
+                                        "%d total). C++ kernel "
+                                        "wrote constant — "
+                                        "float_to_e8m0/fp8 is "
+                                        "broken on this ROCm "
+                                        "build. Scale=%s used "
+                                        "as safe fallback. "
+                                        "Rebuild with: "
+                                        "pip install -e . "
+                                        "--no-build-isolation",
+                                        _mode, _k_const,
+                                        min(4096,
+                                            k_scale_for_pa.numel()
+                                        ),
+                                        k_scale_for_pa.numel(),
+                                        _desc,
+                                    )
+                                else:
+                                    k_scale_for_pa[
+                                        k_scale_for_pa == 0
+                                    ] = _fill_val
+                                    logger.error(
+                                        "FP4 CRITICAL [%s]: "
+                                        "k_scale has %d zero "
+                                        "bytes (%d total). "
+                                        "Replacing zeros "
+                                        "with %s. Rebuild: "
+                                        "pip install -e . "
+                                        "--no-build-isolation",
+                                        _mode, _k_zeros,
+                                        k_scale_for_pa.numel(),
+                                        _desc,
+                                    )
+                            else:
+                                _fill_val = 1e-3
+                                _desc = "float 1e-3"
+                                k_scale_for_pa[
+                                    k_scale_for_pa == 0
+                                ] = _fill_val
+                                logger.error(
+                                    "FP4 CRITICAL [%s]: "
+                                    "k_scale has %d zero "
+                                    "floats (%d total). "
+                                    "Replacing zeros "
+                                    "with %s.",
+                                    _mode, _k_zeros,
+                                    k_scale_for_pa.numel(),
+                                    _desc,
+                                )
+                        if _v_needs_fix:
+                            if _is_uint8:
+                                if _mode == "NVFP4":
+                                    _fill_v = 64
+                                elif _mode in ("MXFP4", "AMXFP4"):
+                                    _fill_v = 127
+                                else:
+                                    _fill_v = 1
+                                if _v_all_same:
+                                    _v_const = int(
+                                        v_scale_for_pa[0].item())
+                                    logger.error(
+                                        "FP4 CRITICAL [%s]: "
+                                        "v_scale ALL SAME "
+                                        "byte=%d. C++ kernel "
+                                        "wrote constant.",
+                                        _mode, _v_const,
+                                    )
+                                else:
+                                    v_scale_for_pa[
+                                        v_scale_for_pa == 0
+                                    ] = _fill_v
+                                    logger.error(
+                                        "FP4 CRITICAL [%s]: "
+                                        "v_scale has %d zero "
+                                        "bytes. Replacing.",
+                                        _mode, _v_zeros,
+                                    )
+                            else:
+                                v_scale_for_pa[
+                                    v_scale_for_pa == 0
+                                ] = 1e-3
+                                logger.error(
+                                    "FP4 CRITICAL [%s]: "
+                                    "v_scale has %d zero "
+                                    "floats. Replacing.",
+                                    _mode, _v_zeros,
+                                )
+
                     torch.ops.aiter.paged_attention_v1(
                         output[:num_decode_tokens],
                         workspace_buffer,
@@ -2334,10 +3563,12 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         v_scale_for_pa,
                         None,
                         _PARTITION_SIZE_ROCM,
-                        k_scale_stride_h=k_scale_stride_h,
-                        v_scale_stride_h=v_scale_stride_h,
-                        fp4_num_k_blocks=fp4_num_k_blocks,
-                        fp4_num_v_blocks=fp4_num_v_blocks,
+                        1,
+                        0,
+                        k_scale_stride_h,
+                        v_scale_stride_h,
+                        fp4_num_k_blocks,
+                        fp4_num_v_blocks,
                     )
 
                     if use_hadamard:

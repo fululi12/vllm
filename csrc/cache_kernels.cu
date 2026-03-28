@@ -897,15 +897,35 @@ __inline__ __device__ float fp4_e2m1_dequant_value(uint8_t nibble) {
 // ---------------------------------------------------------------------------
 __inline__ __device__ uint8_t float_to_e8m0(float x) {
   if (x <= 0.0f) return 0;
-  float log2_x = log2f(x);
-  int biased = static_cast<int>(roundf(log2_x)) + 127;
-  if (biased < 0) biased = 0;
-  if (biased > 254) biased = 254;
-  return static_cast<uint8_t>(biased);
+
+  // Pure IEEE 754 bit extraction — avoids log2f/roundf entirely.
+  // log2f is broken on some ROCm/HIP builds (returns NaN or wrong
+  // values), and -ffast-math can defeat NaN guards.  Bit extraction
+  // is always correct regardless of math library bugs.
+  unsigned int bits;
+  memcpy(&bits, &x, sizeof(bits));
+  int ieee_exp = static_cast<int>((bits >> 23) & 0xFFu);
+  unsigned int mantissa = bits & 0x7FFFFFu;
+
+  if (ieee_exp == 0) return 1;    // subnormal → smallest E8M0
+  if (ieee_exp == 255) return 254; // inf/NaN → largest E8M0
+
+  // E8M0 byte = biased exponent of nearest power-of-2.
+  // IEEE 754 bias (127) matches E8M0 bias, so ieee_exp is the
+  // E8M0 byte for the lower bound.  Round to nearest: if the
+  // mantissa fraction >= sqrt(2)-1 ≈ 0.4142 (i.e. the value is
+  // closer to the next power-of-2), round up.
+  // sqrt(2)-1 in 23-bit mantissa = 0x3504F3.
+  int e8m0 = ieee_exp;
+  if (mantissa >= 0x3504F3u) e8m0++;
+
+  if (e8m0 < 1) e8m0 = 1;
+  if (e8m0 > 254) e8m0 = 254;
+  return static_cast<uint8_t>(e8m0);
 }
 
 __inline__ __device__ float e8m0_to_float(uint8_t e8m0) {
-  if (e8m0 == 255) return 0.0f;
+  if (e8m0 == 0 || e8m0 == 255) return 0.0f;
   return exp2f(static_cast<float>(e8m0) - 127.0f);
 }
 
@@ -923,34 +943,71 @@ __inline__ __device__ float e8m0_to_float(uint8_t e8m0) {
 // binade, reducing round-trip quantization error by ~5% on typical LLM
 // benchmarks (per NVIDIA NVFP4 findings).
 // ---------------------------------------------------------------------------
+__inline__ __device__ float fp8_e4m3_to_float(uint8_t x);  // fwd decl
+
 __inline__ __device__ uint8_t float_to_fp8_e4m3(float x) {
   if (x <= 0.0f) return 0;
   constexpr float FP8_E4M3_MAX = 240.0f;
   x = fminf(x, FP8_E4M3_MAX);
 
-  float log2_x = log2f(x);
-  int exp_unbiased = static_cast<int>(floorf(log2_x));
-  int biased_exp = exp_unbiased + 8;
+  // Pure IEEE 754 bit extraction — avoids log2f/floorf/exp2f entirely.
+  // These math functions are broken on some ROCm/HIP builds (return
+  // NaN), and -ffast-math defeats NaN guards like !(x==x).
+  unsigned int bits;
+  memcpy(&bits, &x, sizeof(bits));
+  int ieee_exp = static_cast<int>((bits >> 23) & 0xFFu);
+  unsigned int ieee_man = bits & 0x7FFFFFu;
+
+  // FP8 E4M3 FNUZ: bias=8.  biased_exp = ieee_exp - 127 + 8 = ieee_exp - 119
+  int biased_exp = ieee_exp - 119;
+
+  if (ieee_exp == 0) {
+    // IEEE subnormal → FP8 subnormal (very small value)
+    return 1;
+  }
 
   if (biased_exp <= 0) {
-    float sub_val = x / exp2f(-7.0f);
-    int mantissa = static_cast<int>(roundf(sub_val * 8.0f));
-    mantissa = min(max(mantissa, 0), 7);
+    // Subnormal in FP8: value = 2^(-7) * (mantissa/8)
+    // x = 2^(ieee_exp - 127) * (1 + ieee_man/2^23)
+    // mantissa = round(x * 128 * 8) = round(x * 1024)
+    // Use bit shifts: x * 1024 = 2^(ieee_exp-127+10) * (1 + ieee_man/2^23)
+    // = 2^(ieee_exp-117) * (1 + ieee_man/2^23)
+    int shift = 117 - ieee_exp;  // >= 1 since biased_exp <= 0 → ieee_exp <= 119
+    unsigned int full = (0x800000u | ieee_man);  // 1.mantissa in Q23
+    unsigned int val;
+    if (shift < 23) {
+      val = full >> shift;
+      unsigned int half = 1u << (shift - 1);
+      if ((full & ((half << 1) - 1)) > half) val++;  // round up
+      else if ((full & ((half << 1) - 1)) == half && (val & 1)) val++;
+    } else {
+      val = 0;
+    }
+    int mantissa = static_cast<int>(val);
+    if (mantissa > 7) mantissa = 7;
+    if (mantissa < 1) mantissa = 1;
     return static_cast<uint8_t>(mantissa);
   }
   if (biased_exp >= 16) {
-    return 0x7F;  // max positive = 240.0
+    return 0x7F;
   }
 
-  float power = exp2f(static_cast<float>(exp_unbiased));
-  float frac = x / power - 1.0f;
-  int mantissa = static_cast<int>(roundf(frac * 8.0f));
+  // Normal FP8: extract 3-bit mantissa from 23-bit IEEE mantissa
+  // Shift right by (23-3)=20, then round.
+  int mantissa = static_cast<int>(ieee_man >> 20);
+  unsigned int remainder = ieee_man & 0xFFFFFu;
+  if (remainder > 0x80000u) {
+    mantissa++;
+  } else if (remainder == 0x80000u && (mantissa & 1)) {
+    mantissa++;  // round to even
+  }
   if (mantissa >= 8) {
     mantissa = 0;
-    biased_exp += 1;
+    biased_exp++;
     if (biased_exp >= 16) return 0x7F;
   }
-  return static_cast<uint8_t>((biased_exp << 3) | (mantissa & 0x7));
+  uint8_t result = static_cast<uint8_t>((biased_exp << 3) | (mantissa & 0x7));
+  return (result == 0 && x > 0.0f) ? static_cast<uint8_t>(1) : result;
 }
 
 __inline__ __device__ float fp8_e4m3_to_float(uint8_t x) {
@@ -1172,7 +1229,7 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
           float rms = sqrtf(sq_lo / static_cast<float>(FP4_QUANT_BLOCK_SIZE));
           eff_max = fminf(blk_lo, rms * static_cast<float>(FP4_BLOCK_CLIP_EFF));
 #endif
-          v_block_scale[b0] = fmaxf(eff_max / FP4_MAX, 1e-12f);
+          v_block_scale[b0] = fmaxf(eff_max / FP4_MAX, 1e-3f);
           v_block_scale_inv[b0] = 1.0f / v_block_scale[b0];
         }
         if (b1 < num_v_quant_blocks) {
@@ -1181,7 +1238,7 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
           float rms = sqrtf(sq_hi / static_cast<float>(FP4_QUANT_BLOCK_SIZE));
           eff_max = fminf(blk_hi, rms * static_cast<float>(FP4_BLOCK_CLIP_EFF));
 #endif
-          v_block_scale[b1] = fmaxf(eff_max / FP4_MAX, 1e-12f);
+          v_block_scale[b1] = fmaxf(eff_max / FP4_MAX, 1e-3f);
           v_block_scale_inv[b1] = 1.0f / v_block_scale[b1];
         }
       }
@@ -1210,11 +1267,11 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
           int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
           int b1 = b0 + 1;
           if (b0 < num_v_quant_blocks && qq_lo > 0.0f) {
-            v_block_scale[b0] = fmaxf(xq_lo / qq_lo, 1e-12f);
+            v_block_scale[b0] = fmaxf(xq_lo / qq_lo, 1e-3f);
             v_block_scale_inv[b0] = 1.0f / v_block_scale[b0];
           }
           if (b1 < num_v_quant_blocks && qq_hi > 0.0f) {
-            v_block_scale[b1] = fmaxf(xq_hi / qq_hi, 1e-12f);
+            v_block_scale[b1] = fmaxf(xq_hi / qq_hi, 1e-3f);
             v_block_scale_inv[b1] = 1.0f / v_block_scale[b1];
           }
         }
@@ -1248,7 +1305,7 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
       v_effective_max = fminf(v_max, v_rms * clip_sigma);
     }
 #endif
-    float v_scale = fmaxf(v_effective_max / FP4_MAX, 1e-12f);
+    float v_scale = fmaxf(v_effective_max / FP4_MAX, 1e-3f);
 #if FP4_MSE_REFINE_ITERS > 0
     for (int refine = 0; refine < FP4_MSE_REFINE_ITERS; refine++) {
       float v_xq = 0.0f, v_qq = 0.0f;
@@ -1268,7 +1325,7 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
         v_xq += __shfl_xor_sync(uint64_t(-1), v_xq, offset);
         v_qq += __shfl_xor_sync(uint64_t(-1), v_qq, offset);
       }
-      if (v_qq > 0.0f) v_scale = fmaxf(v_xq / v_qq, 1e-12f);
+      if (v_qq > 0.0f) v_scale = fmaxf(v_xq / v_qq, 1e-3f);
     }
 #endif
     v_block_scale[0] = v_scale;
@@ -1310,7 +1367,10 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
           float rms = sqrtf(k_sq_lo / static_cast<float>(FP4_QUANT_BLOCK_SIZE));
           eff_max = fminf(blk_lo, rms * static_cast<float>(FP4_BLOCK_CLIP_EFF));
 #endif
-          k_block_scale[b0] = fmaxf(eff_max / FP4_MAX, 1e-12f);
+          // 1e-3f ensures the scale round-trips through FP8 E4M3 FNUZ as
+          // byte >= 1 (boundary ≈ 4.88e-4).  1e-12f would encode as byte 0,
+          // making the PA kernel dequantize all K values in this block as 0.
+          k_block_scale[b0] = fmaxf(eff_max / FP4_MAX, 1e-3f);
           k_block_scale_inv[b0] = 1.0f / k_block_scale[b0];
         }
         if (b1 < num_k_quant_blocks) {
@@ -1319,7 +1379,7 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
           float rms = sqrtf(k_sq_hi / static_cast<float>(FP4_QUANT_BLOCK_SIZE));
           eff_max = fminf(blk_hi, rms * static_cast<float>(FP4_BLOCK_CLIP_EFF));
 #endif
-          k_block_scale[b1] = fmaxf(eff_max / FP4_MAX, 1e-12f);
+          k_block_scale[b1] = fmaxf(eff_max / FP4_MAX, 1e-3f);
           k_block_scale_inv[b1] = 1.0f / k_block_scale[b1];
         }
       }
@@ -1348,11 +1408,11 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
           int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
           int b1 = b0 + 1;
           if (b0 < num_k_quant_blocks && qq_lo > 0.0f) {
-            k_block_scale[b0] = fmaxf(xq_lo / qq_lo, 1e-12f);
+            k_block_scale[b0] = fmaxf(xq_lo / qq_lo, 1e-3f);
             k_block_scale_inv[b0] = 1.0f / k_block_scale[b0];
           }
           if (b1 < num_k_quant_blocks && qq_hi > 0.0f) {
-            k_block_scale[b1] = fmaxf(xq_hi / qq_hi, 1e-12f);
+            k_block_scale[b1] = fmaxf(xq_hi / qq_hi, 1e-3f);
             k_block_scale_inv[b1] = 1.0f / k_block_scale[b1];
           }
         }
@@ -1372,7 +1432,7 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
     for (int offset = warpSize / 2; offset > 0; offset /= 2)
       k_max = fmaxf(k_max,
                     __shfl_xor_sync(uint64_t(-1), k_max, offset));
-    k_block_scale[0] = fmaxf(k_max / FP4_MAX, 1e-12f);
+    k_block_scale[0] = fmaxf(k_max / FP4_MAX, 1e-3f);
     k_block_scale_inv[0] = 1.0f / k_block_scale[0];
   }
 
@@ -1546,7 +1606,7 @@ __global__ void reshape_and_cache_flash_fp4_perchannel_k_pertoken_v_kernel(
   }
 #endif
 
-  float v_scale = fmaxf(v_effective_max / FP4_MAX, 1e-12f);
+  float v_scale = fmaxf(v_effective_max / FP4_MAX, 1e-3f);
 
 #if FP4_PCK_V_MSE_EFF > 0
   for (int refine = 0; refine < FP4_PCK_V_MSE_EFF; refine++) {
@@ -1567,7 +1627,7 @@ __global__ void reshape_and_cache_flash_fp4_perchannel_k_pertoken_v_kernel(
       v_xq += __shfl_xor_sync(uint64_t(-1), v_xq, offset);
       v_qq += __shfl_xor_sync(uint64_t(-1), v_qq, offset);
     }
-    if (v_qq > 0.0f) v_scale = fmaxf(v_xq / v_qq, 1e-12f);
+    if (v_qq > 0.0f) v_scale = fmaxf(v_xq / v_qq, 1e-3f);
   }
 #endif
 
@@ -1752,16 +1812,18 @@ __global__ void reshape_and_cache_flash_fp4_mxfp4_kernel(
       int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
       int b1 = b0 + 1;
       if (b0 < num_k_quant_blocks) {
-        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-30f);
+        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-10f);
         k_e8m0_local[b0] = float_to_e8m0(ideal);
+        if (k_e8m0_local[b0] == 0) k_e8m0_local[b0] = 1;
         float scale = e8m0_to_float(k_e8m0_local[b0]);
-        k_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
+        k_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-38f);
       }
       if (b1 < num_k_quant_blocks) {
-        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-30f);
+        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-10f);
         k_e8m0_local[b1] = float_to_e8m0(ideal);
+        if (k_e8m0_local[b1] == 0) k_e8m0_local[b1] = 1;
         float scale = e8m0_to_float(k_e8m0_local[b1]);
-        k_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
+        k_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-38f);
       }
     }
   }
@@ -1780,16 +1842,18 @@ __global__ void reshape_and_cache_flash_fp4_mxfp4_kernel(
       int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
       int b1 = b0 + 1;
       if (b0 < num_v_quant_blocks) {
-        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-30f);
+        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-10f);
         v_e8m0_local[b0] = float_to_e8m0(ideal);
+        if (v_e8m0_local[b0] == 0) v_e8m0_local[b0] = 1;
         float scale = e8m0_to_float(v_e8m0_local[b0]);
-        v_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
+        v_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-38f);
       }
       if (b1 < num_v_quant_blocks) {
-        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-30f);
+        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-10f);
         v_e8m0_local[b1] = float_to_e8m0(ideal);
+        if (v_e8m0_local[b1] == 0) v_e8m0_local[b1] = 1;
         float scale = e8m0_to_float(v_e8m0_local[b1]);
-        v_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
+        v_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-38f);
       }
     }
   }
@@ -2002,13 +2066,15 @@ __global__ void reshape_and_cache_flash_fp4_nvfp4_kernel(
       int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
       int b1 = b0 + 1;
       if (b0 < num_k_quant_blocks) {
-        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-30f);
+        // 1e-3f lower bound ensures float_to_fp8_e4m3 produces byte >= 1
+        // (FP8 E4M3 FNUZ round-to-nearest boundary ≈ 4.88e-4; 1e-3 > that).
+        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-3f);
         k_fp8_local[b0] = float_to_fp8_e4m3(ideal);
         float scale = fp8_e4m3_to_float(k_fp8_local[b0]);
         k_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
       }
       if (b1 < num_k_quant_blocks) {
-        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-30f);
+        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-3f);
         k_fp8_local[b1] = float_to_fp8_e4m3(ideal);
         float scale = fp8_e4m3_to_float(k_fp8_local[b1]);
         k_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
@@ -2029,13 +2095,13 @@ __global__ void reshape_and_cache_flash_fp4_nvfp4_kernel(
       int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
       int b1 = b0 + 1;
       if (b0 < num_v_quant_blocks) {
-        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-30f);
+        float ideal = fmaxf(blk_lo / FP4_MAX, 1e-3f);
         v_fp8_local[b0] = float_to_fp8_e4m3(ideal);
         float scale = fp8_e4m3_to_float(v_fp8_local[b0]);
         v_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
       }
       if (b1 < num_v_quant_blocks) {
-        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-30f);
+        float ideal = fmaxf(blk_hi / FP4_MAX, 1e-3f);
         v_fp8_local[b1] = float_to_fp8_e4m3(ideal);
         float scale = fp8_e4m3_to_float(v_fp8_local[b1]);
         v_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
@@ -2044,18 +2110,24 @@ __global__ void reshape_and_cache_flash_fp4_nvfp4_kernel(
   }
 
   // --- Store FP8 E4M3 scales (uint8) ---
+  // Safety: ideal >= 1e-3 guarantees float_to_fp8_e4m3 returns >= 1,
+  // but add belt-and-suspenders check in case of GPU math anomalies.
   const int64_t k_blk_stride =
       (num_k_quant_blocks > 1) ? (k_scale_stride_h / num_k_quant_blocks) : 0;
   const int64_t v_blk_stride =
       (num_v_quant_blocks > 1) ? (v_scale_stride_h / num_v_quant_blocks) : 0;
   if (lane_id == 0) {
     for (int b = 0; b < num_k_quant_blocks; b++) {
+      uint8_t kbyte = k_fp8_local[b];
+      if (kbyte == 0) kbyte = 1;
       k_fp8_scales[head_idx * k_scale_stride_h
-                    + b * k_blk_stride + slot_idx] = k_fp8_local[b];
+                    + b * k_blk_stride + slot_idx] = kbyte;
     }
     for (int b = 0; b < num_v_quant_blocks; b++) {
+      uint8_t vbyte = v_fp8_local[b];
+      if (vbyte == 0) vbyte = 1;
       v_fp8_scales[head_idx * v_scale_stride_h
-                    + b * v_blk_stride + slot_idx] = v_fp8_local[b];
+                    + b * v_blk_stride + slot_idx] = vbyte;
     }
   }
 
@@ -2273,17 +2345,19 @@ __global__ void reshape_and_cache_flash_fp4_amxfp4_kernel(
       int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
       int b1 = b0 + 1;
       if (b0 < num_k_quant_blocks) {
-        float ideal = fmaxf(blk_lo_abs / FP4_MAX, 1e-30f);
+        float ideal = fmaxf(blk_lo_abs / FP4_MAX, 1e-10f);
         k_e8m0_local[b0] = float_to_e8m0(ideal);
+        if (k_e8m0_local[b0] == 0) k_e8m0_local[b0] = 1;
         float scale = e8m0_to_float(k_e8m0_local[b0]);
-        k_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
+        k_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-38f);
         k_bm_local[b0] = static_cast<uint8_t>(bm_lo);
       }
       if (b1 < num_k_quant_blocks) {
-        float ideal = fmaxf(blk_hi_abs / FP4_MAX, 1e-30f);
+        float ideal = fmaxf(blk_hi_abs / FP4_MAX, 1e-10f);
         k_e8m0_local[b1] = float_to_e8m0(ideal);
+        if (k_e8m0_local[b1] == 0) k_e8m0_local[b1] = 1;
         float scale = e8m0_to_float(k_e8m0_local[b1]);
-        k_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
+        k_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-38f);
         k_bm_local[b1] = static_cast<uint8_t>(bm_hi);
       }
     }
@@ -2313,17 +2387,19 @@ __global__ void reshape_and_cache_flash_fp4_amxfp4_kernel(
       int b0 = (i * warpSize) / FP4_QUANT_BLOCK_SIZE;
       int b1 = b0 + 1;
       if (b0 < num_v_quant_blocks) {
-        float ideal = fmaxf(blk_lo_abs / FP4_MAX, 1e-30f);
+        float ideal = fmaxf(blk_lo_abs / FP4_MAX, 1e-10f);
         v_e8m0_local[b0] = float_to_e8m0(ideal);
+        if (v_e8m0_local[b0] == 0) v_e8m0_local[b0] = 1;
         float scale = e8m0_to_float(v_e8m0_local[b0]);
-        v_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-30f);
+        v_block_scale_inv[b0] = 1.0f / fmaxf(scale, 1e-38f);
         v_bm_local[b0] = static_cast<uint8_t>(bm_lo);
       }
       if (b1 < num_v_quant_blocks) {
-        float ideal = fmaxf(blk_hi_abs / FP4_MAX, 1e-30f);
+        float ideal = fmaxf(blk_hi_abs / FP4_MAX, 1e-10f);
         v_e8m0_local[b1] = float_to_e8m0(ideal);
+        if (v_e8m0_local[b1] == 0) v_e8m0_local[b1] = 1;
         float scale = e8m0_to_float(v_e8m0_local[b1]);
-        v_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-30f);
+        v_block_scale_inv[b1] = 1.0f / fmaxf(scale, 1e-38f);
         v_bm_local[b1] = static_cast<uint8_t>(bm_hi);
       }
     }

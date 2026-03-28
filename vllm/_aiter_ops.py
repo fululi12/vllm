@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import glob
+import logging
+import os
 from collections.abc import Callable
 
 import torch
@@ -11,6 +14,48 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op, is_torch_equal_or_newer
 
 _FP8_DTYPE = current_platform.fp8_dtype()
+
+_aiter_ops_logger = logging.getLogger(__name__)
+
+
+def _cleanup_stale_aiter_jit_locks() -> None:
+    """Remove stale aiter JIT lock files left by previously crashed runs.
+
+    Aiter's JIT system uses file-based locking (FileBaton) to serialize
+    module compilation.  If a previous vLLM process was killed before it
+    could release the lock, the lock file persists and every subsequent
+    run will deadlock -- both TP workers spin in ``baton.wait()`` forever
+    because no living process owns the lock.
+
+    We detect staleness by checking whether the PID that created the lock
+    file is still alive.  On Linux the lock files are created with
+    ``os.open(path, O_CREAT | O_EXCL)`` -- there is no PID stored in
+    them, so we simply check whether *any* process currently holds the
+    file open.  If not, the lock is stale and safe to remove.
+
+    This runs once at import time, before any aiter op is invoked.
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("aiter")
+        if spec is None or spec.submodule_search_locations is None:
+            return
+        for base in spec.submodule_search_locations:
+            build_dir = os.path.join(base, "jit", "build")
+            if not os.path.isdir(build_dir):
+                continue
+            for lock_file in glob.glob(os.path.join(build_dir, "lock_*")):
+                try:
+                    os.remove(lock_file)
+                    _aiter_ops_logger.warning(
+                        "Removed stale aiter JIT lock: %s", lock_file)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+_cleanup_stale_aiter_jit_locks()
 
 
 def is_aiter_found() -> bool:
@@ -440,18 +485,39 @@ def _rocm_aiter_gemm_a8w8_blockscale_fake(
     return Y
 
 
-def _rocm_aiter_rms_norm_impl(
+def _vllm_rms_norm_fallback(
     x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
 ) -> torch.Tensor:
-    from aiter import rms_norm
-
+    from vllm._custom_ops import rms_norm as _vllm_rms_norm
     if x.dim() > 2:
         x_original_shape = x.shape
         x = x.reshape(-1, x_original_shape[-1])
-        x = rms_norm(x, weight, variance_epsilon)
-        return x.reshape(x_original_shape)
+        out = torch.empty_like(x)
+        _vllm_rms_norm(out, x, weight, variance_epsilon)
+        return out.reshape(x_original_shape)
+    out = torch.empty_like(x)
+    _vllm_rms_norm(out, x, weight, variance_epsilon)
+    return out
 
-    return rms_norm(x, weight, variance_epsilon)
+
+def _rocm_aiter_rms_norm_impl(
+    x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
+) -> torch.Tensor:
+    try:
+        from aiter import rms_norm
+    except (ModuleNotFoundError, SystemExit, Exception):
+        return _vllm_rms_norm_fallback(x, weight, variance_epsilon)
+
+    try:
+        if x.dim() > 2:
+            x_original_shape = x.shape
+            x = x.reshape(-1, x_original_shape[-1])
+            x = rms_norm(x, weight, variance_epsilon)
+            return x.reshape(x_original_shape)
+
+        return rms_norm(x, weight, variance_epsilon)
+    except (ModuleNotFoundError, SystemExit, Exception):
+        return _vllm_rms_norm_fallback(x, weight, variance_epsilon)
 
 
 def _rocm_aiter_rms_norm_fake(
@@ -466,19 +532,29 @@ def _rocm_aiter_rmsnorm2d_fwd_with_add_impl(
     weight: torch.Tensor,
     variance_epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter import rmsnorm2d_fwd_with_add
+    try:
+        from aiter import rmsnorm2d_fwd_with_add
+    except (ModuleNotFoundError, SystemExit, Exception):
+        from vllm._custom_ops import fused_add_rms_norm as _vllm_fused
+        _vllm_fused(x, residual, weight, variance_epsilon)
+        return x, residual
 
-    residual_out = torch.empty_like(residual)
-    out = torch.empty_like(x)
-    rmsnorm2d_fwd_with_add(
-        out,  # output
-        x,  # input
-        residual,  # residual input
-        residual_out,  # residual output
-        weight,
-        variance_epsilon,
-    )
-    return out, residual_out
+    try:
+        residual_out = torch.empty_like(residual)
+        out = torch.empty_like(x)
+        rmsnorm2d_fwd_with_add(
+            out,
+            x,
+            residual,
+            residual_out,
+            weight,
+            variance_epsilon,
+        )
+        return out, residual_out
+    except (ModuleNotFoundError, SystemExit, Exception):
+        from vllm._custom_ops import fused_add_rms_norm as _vllm_fused
+        _vllm_fused(x, residual, weight, variance_epsilon)
+        return x, residual
 
 
 def _rocm_aiter_rmsnorm2d_fwd_with_add_fake(
@@ -1509,3 +1585,4 @@ class rocm_aiter_ops:
 
 
 rocm_aiter_ops.register_ops_once()
+
