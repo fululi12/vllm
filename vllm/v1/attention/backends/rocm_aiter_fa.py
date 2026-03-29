@@ -1093,43 +1093,33 @@ def _get_or_create_fp4_per_channel_k_scales(
     device,
     head_size: int = 128,
 ):
-    """Allocate (once) per-channel K and per-token V scale buffers.
+    """Allocate (once) the per-channel K scale buffer.
 
     K channel scales: ``[num_kv_heads, head_size]`` — static, computed from
     the first prefill batch and frozen.
 
-    V per-token scales: ``[num_kv_heads, total_tokens]`` — dynamic, written
-    at cache-write time.
+    Block-level K/V scale buffers (per-block-32) are allocated separately
+    by ``_get_or_create_fp4_pertoken_scales`` so that PER_CHANNEL_K mode
+    reuses the proven DEFAULT kernel infrastructure for quantisation.
 
-    Returns (k_channel_scales, v_scales_flat, v_scales_2d, k_scales_ready).
+    Returns (k_channel_scales, k_scales_ready).
     ``k_scales_ready`` is False when K channel scales have not yet been
     computed (first call) and True after initialization.
     """
     if hasattr(layer, "_fp4_k_channel_scales"):
         return (
             layer._fp4_k_channel_scales,
-            layer._fp4_v_pertoken_scales_flat,
-            layer._fp4_v_pertoken_scales_2d,
-            True,
+            layer._fp4_k_channel_scales_ready,
         )
 
     k_ch = torch.ones(
         num_kv_heads, head_size, dtype=torch.float32, device=device
     )
 
-    v_flat_size = num_kv_heads * total_tokens
-    v_flat = torch.zeros(v_flat_size, dtype=torch.float32, device=device)
-    v_2d = v_flat.view(num_kv_heads, total_tokens)
-
     layer._fp4_k_channel_scales = k_ch
-    layer._fp4_v_pertoken_scales_flat = v_flat
-    layer._fp4_v_pertoken_scales_2d = v_2d
-    layer._fp4_v_scale_stride_h = total_tokens
-    layer._fp4_num_v_blocks = 1
-    layer._fp4_num_k_blocks = 0
     layer._fp4_k_channel_scales_ready = False
 
-    return k_ch, v_flat, v_2d, False
+    return k_ch, False
 
 
 def _get_or_create_fp4_mxfp4_scales(
@@ -2387,6 +2377,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         v_scale: float,
         fp4_k_scales_2d: torch.Tensor | None = None,
         fp4_v_scales_2d: torch.Tensor | None = None,
+        fp4_k_channel_scales: torch.Tensor | None = None,
     ):
         assert attn_metadata.extend_metadata is not None
         assert attn_metadata.extend_metadata.chunk_context_metadata is not None
@@ -2419,6 +2410,12 @@ class AiterFlashAttentionImpl(AttentionImpl):
             k_dequant_scales_2d=fp4_k_scales_2d,
             v_dequant_scales_2d=fp4_v_scales_2d,
         )
+        if (_FP4_PER_CHANNEL_K
+                and fp4_k_channel_scales is not None):
+            key_fetched[:swa_total_tokens] = (
+                key_fetched[:swa_total_tokens].float()
+                * fp4_k_channel_scales.unsqueeze(0)
+            ).to(key_fetched.dtype)
 
         aiter.flash_attn_varlen_func(
             q=query,
@@ -2457,6 +2454,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         v_scale: float,
         fp4_k_scales_2d: torch.Tensor | None = None,
         fp4_v_scales_2d: torch.Tensor | None = None,
+        fp4_k_channel_scales: torch.Tensor | None = None,
     ):
         if self.sliding_window[0] != -1:
             self.extend_for_sliding_window(
@@ -2472,6 +2470,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 v_scale,
                 fp4_k_scales_2d,
                 fp4_v_scales_2d,
+                fp4_k_channel_scales,
             )
             return
         out, lse = aiter.flash_attn_varlen_func(
@@ -2520,6 +2519,13 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 k_dequant_scales_2d=fp4_k_scales_2d,
                 v_dequant_scales_2d=fp4_v_scales_2d,
             )
+            if (_FP4_PER_CHANNEL_K
+                    and fp4_k_channel_scales is not None):
+                _ttb = total_token_per_batch[chunk_idx]
+                key_fetched[:_ttb] = (
+                    key_fetched[:_ttb].float()
+                    * fp4_k_channel_scales.unsqueeze(0)
+                ).to(key_fetched.dtype)
 
             suf_out, suf_lse = aiter.flash_attn_varlen_func(
                 q=query,
@@ -2828,7 +2834,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         )
                 elif _FP4_PER_CHANNEL_K:
                     (
-                        k_ch_scales, v_flat, v_2d, k_ready,
+                        k_ch_scales, k_ready,
                     ) = _get_or_create_fp4_per_channel_k_scales(
                         layer, num_kv_heads, total_tokens,
                         key_cache.device, head_size,
@@ -2843,13 +2849,23 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         )
                         k_ch_scales.copy_(optimized_scales)
                         layer._fp4_k_channel_scales_ready = True
+                    cache_key_pck = (
+                        cache_key.float()
+                        / k_ch_scales.unsqueeze(0)
+                    ).to(cache_key.dtype)
+                    (
+                        k_flat, v_flat, k_2d, v_2d,
+                    ) = _get_or_create_fp4_pertoken_scales(
+                        layer, num_kv_heads, total_tokens,
+                        key_cache.device, head_size,
+                    )
                     torch.ops._C_cache_ops \
-                        .reshape_and_cache_flash_fp4_per_channel_k_per_token_v(
-                            cache_key,
+                        .reshape_and_cache_flash_with_pertoken_quant(
+                            cache_key_pck,
                             cache_value,
                             key_cache,
                             value_cache,
-                            k_ch_scales,
+                            k_2d,
                             v_2d,
                             attn_metadata.slot_mapping,
                             self.kv_cache_dtype,
@@ -3035,10 +3051,12 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     elif _FP4_PER_CHANNEL_K and hasattr(
                         layer, "_fp4_k_channel_scales"
                     ):
-                        fp4_k_scales_2d = \
-                            layer._fp4_k_channel_scales
-                        fp4_v_scales_2d = \
-                            layer._fp4_v_pertoken_scales_2d
+                        fp4_k_scales_2d = getattr(
+                            layer, "_fp4_k_dequant_scales_2d", None
+                        )
+                        fp4_v_scales_2d = getattr(
+                            layer, "_fp4_v_dequant_scales_2d", None
+                        )
                     else:
                         fp4_k_scales_2d = getattr(
                             layer, "_fp4_k_dequant_scales_2d", None
@@ -3046,6 +3064,10 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         fp4_v_scales_2d = getattr(
                             layer, "_fp4_v_dequant_scales_2d", None
                         )
+                _pck_ch = (
+                    getattr(layer, "_fp4_k_channel_scales", None)
+                    if _FP4_PER_CHANNEL_K else None
+                )
                 self.extend_forward(
                     attn_metadata=attn_metadata,
                     query=extend_querys,
@@ -3068,6 +3090,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     v_scale=layer._v_scale,
                     fp4_k_scales_2d=fp4_k_scales_2d,
                     fp4_v_scales_2d=fp4_v_scales_2d,
+                    fp4_k_channel_scales=_pck_ch,
                 )
 
             # calculate for decodes
@@ -3222,16 +3245,18 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             layer, "_fp4_k_channel_scales"
                         ):
                             fp4_per_channel_k_active = True
-                            k_scale_for_pa = torch.ones(
-                                1, dtype=torch.float32,
-                                device=output.device,
-                            )
+                            k_scale_for_pa = \
+                                layer._fp4_k_dequant_scales_flat
                             v_scale_for_pa = \
-                                layer._fp4_v_pertoken_scales_flat
+                                layer._fp4_v_dequant_scales_flat
+                            k_scale_stride_h = \
+                                layer._fp4_k_scale_stride_h
                             v_scale_stride_h = \
                                 layer._fp4_v_scale_stride_h
-                            fp4_num_k_blocks = 0
-                            fp4_num_v_blocks = 1
+                            fp4_num_k_blocks = getattr(
+                                layer, "_fp4_num_k_blocks", 4)
+                            fp4_num_v_blocks = getattr(
+                                layer, "_fp4_num_v_blocks", 4)
                         else:
                             k_scale_for_pa = \
                                 layer._fp4_k_dequant_scales_flat
