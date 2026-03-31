@@ -100,10 +100,17 @@ def if_aiter_supported(func: Callable) -> Callable:
 # because it returns wrong result on gfx942.
 # This is a workaround to get the correct FP8 dtype.
 # This might because that the get_gfx() is wrapped as a custom op.
+AITER_FP8_DTYPE = torch.float8_e4m3fn  # safe default
 if is_aiter_found_and_supported():
-    from aiter import dtypes
-
-    AITER_FP8_DTYPE = dtypes.fp8
+    try:
+        from aiter import dtypes
+        AITER_FP8_DTYPE = dtypes.fp8
+    except (ImportError, Exception):
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Could not import aiter.dtypes; using torch.float8_e4m3fn "
+            "as AITER_FP8_DTYPE fallback."
+        )
 
 
 def _rocm_aiter_fused_moe_impl(
