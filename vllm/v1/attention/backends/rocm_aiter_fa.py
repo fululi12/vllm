@@ -183,6 +183,8 @@ def _ensure_mxfp4_op_available():
             "MXFP4: native reshape_and_cache_flash_fp4_mxfp4 "
             "cache-write kernel detected")
     else:
+        global _MXFP4_USE_PYTHON_FALLBACK
+        _MXFP4_USE_PYTHON_FALLBACK = True
         logger.warning(
             "VLLM_FP4_MXFP4=1: C++ MXFP4 kernel not found. "
             "Will use pure Python MXFP4 fallback (slower). "
@@ -216,7 +218,7 @@ _NVFP4_NATIVE_VALIDATION_REQUIRED = 3
 _NVFP4_USING_PYTHON_FALLBACK = False
 _MXFP4_KERNEL_VALIDATED = False
 _MXFP4_USE_PYTHON_FALLBACK = (
-    os.environ.get("VLLM_FP4_MXFP4_CPP", "0") != "1"
+    os.environ.get("VLLM_FP4_MXFP4_PYTHON", "0") == "1"
 )
 
 
@@ -1371,11 +1373,15 @@ def _get_or_create_fp4_amxfp4_scales(
     k_packed = torch.zeros(
         num_kv_heads * num_blocks * 2, total_tokens,
         dtype=torch.uint8, device=device)
-    k_packed[:num_kv_heads * num_blocks, :] = _E8M0_ONE
     v_packed = torch.zeros(
         num_kv_heads * num_blocks * 2, total_tokens,
         dtype=torch.uint8, device=device)
-    v_packed[:num_kv_heads * num_blocks, :] = _E8M0_ONE
+    # PA kernel expects per-head interleaved layout:
+    #   [head0 E8M0 blocks | head0 BM blocks | head1 E8M0 | head1 BM | ...]
+    for h in range(num_kv_heads):
+        dst = h * 2 * num_blocks
+        k_packed[dst:dst + num_blocks, :] = _E8M0_ONE
+        v_packed[dst:dst + num_blocks, :] = _E8M0_ONE
 
     layer._fp4_amxfp4_k_scales_2d = k_scales_2d
     layer._fp4_amxfp4_v_scales_2d = v_scales_2d
@@ -1586,11 +1592,21 @@ if current_platform.is_rocm():
                 if is_amxfp4_mode:
                     num_k_blocks = k_dequant_scales_2d.shape[0] // \
                         (num_heads * 2)
-                    total_krows = num_heads * num_k_blocks
+                    # Packed buffer is per-head interleaved:
+                    #   [h0_e8m0(NB), h0_bm(NB), h1_e8m0, h1_bm, ...]
+                    _ke = []
+                    _kb = []
+                    for _h in range(num_heads):
+                        _base = _h * 2 * num_k_blocks
+                        _ke += list(range(
+                            _base, _base + num_k_blocks))
+                        _kb += list(range(
+                            _base + num_k_blocks,
+                            _base + 2 * num_k_blocks))
                     k_e8m0_raw = k_dequant_scales_2d[
-                        :total_krows, physical_slot_idx]
+                        _ke][:, physical_slot_idx]
                     k_bm_raw = k_dequant_scales_2d[
-                        total_krows:, physical_slot_idx]
+                        _kb][:, physical_slot_idx]
                     k_sc_float = torch.pow(
                         2.0, k_e8m0_raw.float() - 127.0)
                     k_sc_float = k_sc_float.reshape(
@@ -1673,11 +1689,19 @@ if current_platform.is_rocm():
                 if is_amxfp4_mode:
                     num_v_blocks = v_dequant_scales_2d.shape[0] // \
                         (num_heads * 2)
-                    total_vrows = num_heads * num_v_blocks
+                    _ve = []
+                    _vb = []
+                    for _h in range(num_heads):
+                        _base = _h * 2 * num_v_blocks
+                        _ve += list(range(
+                            _base, _base + num_v_blocks))
+                        _vb += list(range(
+                            _base + num_v_blocks,
+                            _base + 2 * num_v_blocks))
                     v_e8m0_raw = v_dequant_scales_2d[
-                        :total_vrows, physical_slot_idx]
+                        _ve][:, physical_slot_idx]
                     v_bm_raw = v_dequant_scales_2d[
-                        total_vrows:, physical_slot_idx]
+                        _vb][:, physical_slot_idx]
                     v_sc_float = torch.pow(
                         2.0, v_e8m0_raw.float() - 127.0)
                     v_sc_float = v_sc_float.reshape(
@@ -2636,6 +2660,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
             if self.kv_cache_dtype.startswith("fp4") and getattr(
                 layer, "fp4_per_token_quant", False
             ):
+                _is_capturing = (
+                    torch.cuda.is_current_stream_capturing())
                 _ensure_amxfp4_op_available()
                 _ensure_nvfp4_op_available()
                 _ensure_mxfp4_op_available()
@@ -2703,10 +2729,19 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         )
                     num_blk = layer._fp4_num_k_blocks
                     num_h = num_kv_heads
-                    k_packed_2d[:num_h * num_blk, :].copy_(k_scales_2d)
-                    k_packed_2d[num_h * num_blk:, :].copy_(k_bm_2d)
-                    v_packed_2d[:num_h * num_blk, :].copy_(v_scales_2d)
-                    v_packed_2d[num_h * num_blk:, :].copy_(v_bm_2d)
+                    # PA kernel expects per-head interleaved layout:
+                    #   [h0 E8M0 | h0 BM | h1 E8M0 | h1 BM | ...]
+                    for _h in range(num_h):
+                        _src = _h * num_blk
+                        _dst = _h * 2 * num_blk
+                        k_packed_2d[_dst:_dst + num_blk, :].copy_(
+                            k_scales_2d[_src:_src + num_blk, :])
+                        k_packed_2d[_dst + num_blk:_dst + 2 * num_blk, :] \
+                            .copy_(k_bm_2d[_src:_src + num_blk, :])
+                        v_packed_2d[_dst:_dst + num_blk, :].copy_(
+                            v_scales_2d[_src:_src + num_blk, :])
+                        v_packed_2d[_dst + num_blk:_dst + 2 * num_blk, :] \
+                            .copy_(v_bm_2d[_src:_src + num_blk, :])
                 elif _FP4_NVFP4:
                     (
                         k_fp8_flat, v_fp8_flat,
@@ -2715,15 +2750,35 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         layer, num_kv_heads, total_tokens,
                         key_cache.device, head_size,
                     )
-                    _nvfp4_write_cache(
-                        cache_key, cache_value,
-                        key_cache, value_cache,
-                        k_fp8_2d, v_fp8_2d,
-                        layer, num_kv_heads, total_tokens,
-                        head_size,
-                        attn_metadata.slot_mapping,
-                        self.kv_cache_dtype,
-                    )
+                    if _is_capturing:
+                        if _NVFP4_HAS_DIRECT_OP:
+                            torch.ops._C_cache_ops \
+                                .reshape_and_cache_flash_fp4_nvfp4(
+                                    cache_key, cache_value,
+                                    key_cache, value_cache,
+                                    k_fp8_2d, v_fp8_2d,
+                                    attn_metadata.slot_mapping,
+                                    self.kv_cache_dtype,
+                                )
+                        else:
+                            torch.ops._C_cache_ops \
+                                .reshape_and_cache_flash_with_pertoken_quant(
+                                    cache_key, cache_value,
+                                    key_cache, value_cache,
+                                    k_fp8_2d, v_fp8_2d,
+                                    attn_metadata.slot_mapping,
+                                    self.kv_cache_dtype,
+                                )
+                    else:
+                        _nvfp4_write_cache(
+                            cache_key, cache_value,
+                            key_cache, value_cache,
+                            k_fp8_2d, v_fp8_2d,
+                            layer, num_kv_heads, total_tokens,
+                            head_size,
+                            attn_metadata.slot_mapping,
+                            self.kv_cache_dtype,
+                        )
                 elif _FP4_MXFP4:
                     (
                         k_e8m0_flat, v_e8m0_flat, k_e8m0_2d, v_e8m0_2d,
@@ -2736,102 +2791,120 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     global _MXFP4_USE_PYTHON_FALLBACK
                     if not _MXFP4_WRITE_DIAGNOSED:
                         _MXFP4_WRITE_DIAGNOSED = True
-                        _path = ("Python (default, safe)"
+                        _path = ("Python (VLLM_FP4_MXFP4_PYTHON=1)"
                                  if _MXFP4_USE_PYTHON_FALLBACK
-                                 else "C++ (VLLM_FP4_MXFP4_CPP=1)")
+                                 else "C++ (default)")
                         logger.info(
                             "MXFP4 write path first call: "
                             "mode=%s "
                             "k_e8m0 shape=%s "
                             "num_tokens=%d total_slots=%d "
                             "head_size=%d num_kv_heads=%d "
-                            "(set VLLM_FP4_MXFP4_CPP=1 to try "
-                            "C++ kernel after rebuild)",
+                            "(set VLLM_FP4_MXFP4_PYTHON=1 to force "
+                            "Python fallback)",
                             _path,
                             list(k_e8m0_2d.shape),
                             cache_key.shape[0], total_tokens,
                             head_size, num_kv_heads,
                         )
-                    _use_python = _MXFP4_USE_PYTHON_FALLBACK
-                    if not _use_python:
-                        try:
-                            torch.ops._C_cache_ops \
-                                .reshape_and_cache_flash_fp4_mxfp4(
-                                    cache_key,
-                                    cache_value,
-                                    key_cache,
-                                    value_cache,
-                                    k_e8m0_2d,
-                                    v_e8m0_2d,
-                                    attn_metadata.slot_mapping,
-                                    self.kv_cache_dtype,
-                                )
-                        except Exception as e:
-                            logger.warning(
-                                "MXFP4 C++ kernel failed: %s. "
-                                "Switching to Python fallback "
-                                "permanently.", e)
-                            _MXFP4_USE_PYTHON_FALLBACK = True
-                            _use_python = True
+                    if _is_capturing:
+                        torch.ops._C_cache_ops \
+                            .reshape_and_cache_flash_fp4_mxfp4(
+                                cache_key,
+                                cache_value,
+                                key_cache,
+                                value_cache,
+                                k_e8m0_2d,
+                                v_e8m0_2d,
+                                attn_metadata.slot_mapping,
+                                self.kv_cache_dtype,
+                            )
+                    else:
+                        _use_python = _MXFP4_USE_PYTHON_FALLBACK
+                        if not _use_python:
+                            try:
+                                torch.ops._C_cache_ops \
+                                    .reshape_and_cache_flash_fp4_mxfp4(
+                                        cache_key,
+                                        cache_value,
+                                        key_cache,
+                                        value_cache,
+                                        k_e8m0_2d,
+                                        v_e8m0_2d,
+                                        attn_metadata.slot_mapping,
+                                        self.kv_cache_dtype,
+                                    )
+                            except Exception as e:
+                                logger.warning(
+                                    "MXFP4 C++ kernel failed: %s. "
+                                    "Switching to Python fallback "
+                                    "permanently.", e)
+                                _MXFP4_USE_PYTHON_FALLBACK = True
+                                _use_python = True
 
-                        if not _use_python and \
-                                not _MXFP4_KERNEL_VALIDATED:
-                            valid_slots = attn_metadata.slot_mapping[
-                                attn_metadata.slot_mapping >= 0]
-                            if valid_slots.numel() > 0:
-                                torch.cuda.current_stream(
-                                    key_cache.device
-                                ).synchronize()
-                                sample = k_e8m0_2d[
-                                    0, valid_slots[:min(
-                                        32, valid_slots.numel()
-                                    )]]
-                                nz = int(
-                                    sample.count_nonzero().item())
-                                n_unique = int(
-                                    sample.unique().numel())
-                                _bad = False
-                                if nz == 0:
-                                    _bad = True
-                                    _reason = (
-                                        "ALL ZERO E8M0 bytes")
-                                elif n_unique == 1:
-                                    _bad = True
-                                    _reason = (
-                                        "ALL SAME byte=%d "
-                                        "(kernel likely wrote "
-                                        "constant due to broken "
-                                        "log2f/roundf)"
-                                        % sample[0].item())
-                                if not _bad:
-                                    _MXFP4_KERNEL_VALIDATED = True
-                                    logger.info(
-                                        "MXFP4 C++ kernel "
-                                        "validated: %d/%d "
-                                        "nonzero, %d unique "
-                                        "E8M0 bytes.",
-                                        nz, sample.numel(),
-                                        n_unique)
-                                else:
-                                    logger.error(
-                                        "MXFP4 C++ kernel: "
-                                        "%s (%d samples). "
-                                        "Switching to Python "
-                                        "fallback permanently.",
-                                        _reason,
-                                        sample.numel())
-                                    _MXFP4_USE_PYTHON_FALLBACK = \
-                                        True
-                                    _use_python = True
+                            if not _use_python and \
+                                    not _MXFP4_KERNEL_VALIDATED:
+                                valid_slots = \
+                                    attn_metadata.slot_mapping[
+                                        attn_metadata.slot_mapping
+                                        >= 0]
+                                if valid_slots.numel() > 0:
+                                    torch.cuda.current_stream(
+                                        key_cache.device
+                                    ).synchronize()
+                                    sample = k_e8m0_2d[
+                                        0, valid_slots[:min(
+                                            32,
+                                            valid_slots.numel()
+                                        )]]
+                                    nz = int(
+                                        sample.count_nonzero()
+                                            .item())
+                                    n_unique = int(
+                                        sample.unique().numel())
+                                    _bad = False
+                                    _val0 = int(sample[0].item())
+                                    if nz == 0:
+                                        _bad = True
+                                        _reason = (
+                                            "ALL ZERO E8M0 bytes")
+                                    elif n_unique == 1 and _val0 == 127:
+                                        _bad = True
+                                        _reason = (
+                                            "ALL 127 E8M0 bytes "
+                                            "(broken log2f/roundf "
+                                            "on ROCm)")
+                                    if not _bad:
+                                        _MXFP4_KERNEL_VALIDATED = \
+                                            True
+                                        logger.info(
+                                            "MXFP4 C++ kernel "
+                                            "validated: %d/%d "
+                                            "nonzero, %d unique "
+                                            "E8M0 bytes "
+                                            "(val0=%d).",
+                                            nz, sample.numel(),
+                                            n_unique, _val0)
+                                    else:
+                                        logger.error(
+                                            "MXFP4 C++ kernel: "
+                                            "%s (%d samples). "
+                                            "Switching to Python "
+                                            "fallback permanently.",
+                                            _reason,
+                                            sample.numel())
+                                        _MXFP4_USE_PYTHON_FALLBACK\
+                                            = True
+                                        _use_python = True
 
-                    if _use_python:
-                        _mxfp4_write_cache_python(
-                            cache_key, cache_value,
-                            key_cache, value_cache,
-                            k_e8m0_2d, v_e8m0_2d,
-                            attn_metadata.slot_mapping,
-                            total_tokens,
-                        )
+                        if _use_python:
+                            _mxfp4_write_cache_python(
+                                cache_key, cache_value,
+                                key_cache, value_cache,
+                                k_e8m0_2d, v_e8m0_2d,
+                                attn_metadata.slot_mapping,
+                                total_tokens,
+                            )
                 elif _FP4_PER_CHANNEL_K:
                     (
                         k_ch_scales, k_ready,
@@ -2889,8 +2962,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             v_2d.dtype, list(v_2d.shape),
                             cache_key.shape[0], head_size,
                         )
-                    _default_use_python = False
-                    try:
+                    if _is_capturing:
                         torch.ops._C_cache_ops \
                             .reshape_and_cache_flash_with_pertoken_quant(
                                 cache_key,
@@ -2902,37 +2974,53 @@ class AiterFlashAttentionImpl(AttentionImpl):
                                 attn_metadata.slot_mapping,
                                 self.kv_cache_dtype,
                             )
-                        valid_slots = attn_metadata.slot_mapping[
-                            attn_metadata.slot_mapping >= 0]
-                        if valid_slots.numel() > 0:
-                            torch.cuda.current_stream(
-                                key_cache.device
-                            ).synchronize()
-                            sample = k_2d[
-                                0, valid_slots[:min(
-                                    32, valid_slots.numel()
-                                )]]
-                            if sample.abs().sum().item() == 0:
-                                logger.warning(
-                                    "Default FP4 C++ write "
-                                    "kernel produced all-zero "
-                                    "scales (%d samples). "
-                                    "Falling back to Python.",
-                                    sample.numel())
-                                _default_use_python = True
-                    except Exception as e:
-                        logger.warning(
-                            "Default FP4 C++ write kernel failed: "
-                            "%s. Using Python fallback.", e)
-                        _default_use_python = True
-                    if _default_use_python:
-                        _fp4_default_python_write(
-                            cache_key, cache_value,
-                            key_cache, value_cache,
-                            k_2d, v_2d,
-                            attn_metadata.slot_mapping,
-                            head_size,
-                        )
+                    else:
+                        _default_use_python = False
+                        try:
+                            torch.ops._C_cache_ops \
+                                .reshape_and_cache_flash_with_pertoken_quant(
+                                    cache_key,
+                                    cache_value,
+                                    key_cache,
+                                    value_cache,
+                                    k_2d,
+                                    v_2d,
+                                    attn_metadata.slot_mapping,
+                                    self.kv_cache_dtype,
+                                )
+                            valid_slots = \
+                                attn_metadata.slot_mapping[
+                                    attn_metadata.slot_mapping >= 0]
+                            if valid_slots.numel() > 0:
+                                torch.cuda.current_stream(
+                                    key_cache.device
+                                ).synchronize()
+                                sample = k_2d[
+                                    0, valid_slots[:min(
+                                        32, valid_slots.numel()
+                                    )]]
+                                if sample.abs().sum().item() == 0:
+                                    logger.warning(
+                                        "Default FP4 C++ write "
+                                        "kernel produced all-zero "
+                                        "scales (%d samples). "
+                                        "Falling back to Python.",
+                                        sample.numel())
+                                    _default_use_python = True
+                        except Exception as e:
+                            logger.warning(
+                                "Default FP4 C++ write kernel "
+                                "failed: %s. Using Python "
+                                "fallback.", e)
+                            _default_use_python = True
+                        if _default_use_python:
+                            _fp4_default_python_write(
+                                cache_key, cache_value,
+                                key_cache, value_cache,
+                                k_2d, v_2d,
+                                attn_metadata.slot_mapping,
+                                head_size,
+                            )
             elif USING_SHUFFLE_LAYOUT:
                 num_blocks, block_size, num_kv_heads, head_size = \
                     key_cache.shape
@@ -3310,8 +3398,12 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     # --- Universal FP4 decode-time diagnostic + self-healing ---
                     # One-time per-layer check on first decode: log mode,
                     # validate scales, and fix zero-byte positions.
-                    if not getattr(
-                        layer, "_fp4_decode_validated", False
+                    # Skip during CUDA graph capture (sync ops forbidden).
+                    if (
+                        not getattr(
+                            layer, "_fp4_decode_validated", False)
+                        and not torch.cuda
+                            .is_current_stream_capturing()
                     ):
                         layer._fp4_decode_validated = True
                         torch.cuda.current_stream(
