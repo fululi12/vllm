@@ -868,6 +868,12 @@ _FP4_PCK_MSE_ITERS = int(
 _FP4_PCK_SAFETY_MARGIN = float(
     os.environ.get("VLLM_FP4_PCK_SAFETY_MARGIN", "1.0")
 )
+_FP4_PCK_MIN_TOKENS = int(
+    os.environ.get("VLLM_FP4_PCK_MIN_TOKENS", "64")
+)
+_FP4_PCK_MAX_BLOCK_RATIO = float(
+    os.environ.get("VLLM_FP4_PCK_MAX_BLOCK_RATIO", "8.0")
+)
 
 
 def _fp4_round_trip(x: torch.Tensor) -> torch.Tensor:
@@ -896,6 +902,7 @@ def _compute_k_channel_scales(
     clip_sigma: float = 0.0,
     mse_iters: int = 2,
     safety_margin: float = 1.0,
+    max_block_ratio: float = 8.0,
 ) -> torch.Tensor:
     """Compute per-channel K scales from prefill data with optimizations.
 
@@ -904,11 +911,15 @@ def _compute_k_channel_scales(
         clip_sigma: outlier clipping sigma (0 = disabled)
         mse_iters: MSE-optimal refinement iterations
         safety_margin: multiplicative safety margin (>= 1.0)
+        max_block_ratio: maximum allowed ratio between scales within
+            a quantization block of 32.  Prevents extreme dynamic range
+            within blocks that destroys per-block-32 FP4 precision.
 
     Returns:
         k_channel_scales: [num_kv_heads, head_size] float32
     """
     FP4_MAX = 6.0
+    BLOCK_SIZE = 32
 
     k_ch_max = k_data.abs().amax(dim=0)
     effective_max = k_ch_max
@@ -934,6 +945,18 @@ def _compute_k_channel_scales(
 
     if safety_margin > 1.0:
         k_ch_scales = k_ch_scales * safety_margin
+
+    if max_block_ratio > 1.0:
+        num_heads = k_ch_scales.shape[0]
+        head_size = k_ch_scales.shape[1]
+        num_blocks = head_size // BLOCK_SIZE
+        for b in range(num_blocks):
+            s = b * BLOCK_SIZE
+            e = s + BLOCK_SIZE
+            blk = k_ch_scales[:, s:e]
+            blk_max = blk.amax(dim=1, keepdim=True)
+            floor = blk_max / max_block_ratio
+            k_ch_scales[:, s:e] = torch.maximum(blk, floor)
 
     return k_ch_scales
 
@@ -2912,16 +2935,41 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         layer, num_kv_heads, total_tokens,
                         key_cache.device, head_size,
                     )
-                    if not k_ready:
+                    _num_tok = cache_key.shape[0]
+                    if (
+                        not k_ready
+                        and _num_tok >= _FP4_PCK_MIN_TOKENS
+                        and not torch.cuda
+                            .is_current_stream_capturing()
+                    ):
                         k_data = cache_key.float()
                         optimized_scales = _compute_k_channel_scales(
                             k_data,
                             clip_sigma=_FP4_PCK_CLIP_SIGMA,
                             mse_iters=_FP4_PCK_MSE_ITERS,
                             safety_margin=_FP4_PCK_SAFETY_MARGIN,
+                            max_block_ratio=(
+                                _FP4_PCK_MAX_BLOCK_RATIO),
                         )
                         k_ch_scales.copy_(optimized_scales)
                         layer._fp4_k_channel_scales_ready = True
+                        if not getattr(
+                            self, "_pck_scales_logged", False
+                        ):
+                            self._pck_scales_logged = True
+                            logger.info(
+                                "PER_CHANNEL_K: computed ch "
+                                "scales from %d tokens "
+                                "(min=%.4g max=%.4g "
+                                "mean=%.4g)",
+                                _num_tok,
+                                float(optimized_scales
+                                      .min().item()),
+                                float(optimized_scales
+                                      .max().item()),
+                                float(optimized_scales
+                                      .mean().item()),
+                            )
                     cache_key_pck = (
                         cache_key.float()
                         / k_ch_scales.unsqueeze(0)
