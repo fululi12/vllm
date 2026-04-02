@@ -1453,21 +1453,21 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
   }
 
   // --- Pass 2: quantize to FP4 E2M1, pack pairs, write to cache -------------
-#if FP4_USE_IN_KERNEL_WHT
-  // Scatter WHT'd float32 values to shared memory so each lane can read
-  // adjacent element-pairs for nibble packing without any BF16 roundtrip.
-  __shared__ float k_wht_smem[512];
-  __shared__ float v_wht_smem[512];
+  // Scatter float32 values (possibly WHT'd) to shared memory so each lane
+  // can read adjacent element-pairs for nibble packing.  This eliminates a
+  // second global-memory read and BF16→float conversion that the non-WHT
+  // path previously required.  The kernel is single-wavefront (64 threads)
+  // so no explicit barrier is needed between the smem write and read.
+  __shared__ float k_smem[512];
+  __shared__ float v_smem[512];
 #pragma unroll
   for (int i = 0; i < LOCAL_DIM_ELEMS; i++) {
     int d = lane_id + i * warpSize;
     if (d < head_size) {
-      k_wht_smem[d] = k_local[i];
-      v_wht_smem[d] = v_local[i];
+      k_smem[d] = k_local[i];
+      v_smem[d] = v_local[i];
     }
   }
-  // Single-wavefront block → implicit barrier
-#endif
 
   uint8_t* k_dst = key_cache + block_idx * block_stride
                     + block_offset * page_stride
@@ -1480,33 +1480,18 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
     int d0 = 2 * j;
     int d1 = d0 + 1;
 
-    // K: per-block scale (both d0 and d1 are in the same block since
-    // d0 is even and FP4_QUANT_BLOCK_SIZE is a multiple of 2)
     int kb = (num_k_quant_blocks > 1) ? (d0 / FP4_QUANT_BLOCK_SIZE) : 0;
     float k_sinv = k_block_scale_inv[kb];
-
-#if FP4_USE_IN_KERNEL_WHT
-    float kf0 = k_wht_smem[d0] * k_sinv;
-    float kf1 = k_wht_smem[d1] * k_sinv;
-#else
-    float kf0 = static_cast<float>(k_src[d0]) * k_sinv;
-    float kf1 = static_cast<float>(k_src[d1]) * k_sinv;
-#endif
+    float kf0 = k_smem[d0] * k_sinv;
+    float kf1 = k_smem[d1] * k_sinv;
     uint8_t kn0 = fp4_e2m1_quantize_nibble(kf0);
     uint8_t kn1 = fp4_e2m1_quantize_nibble(kf1);
     k_dst[j] = (kn0 & 0xF) | ((kn1 & 0xF) << 4);
 
-    // V: per-block scale (both d0 and d1 are in the same block)
     int vb = (num_v_quant_blocks > 1) ? (d0 / FP4_QUANT_BLOCK_SIZE) : 0;
     float v_sinv = v_block_scale_inv[vb];
-
-#if FP4_USE_IN_KERNEL_WHT
-    float vf0 = v_wht_smem[d0] * v_sinv;
-    float vf1 = v_wht_smem[d1] * v_sinv;
-#else
-    float vf0 = static_cast<float>(v_src[d0]) * v_sinv;
-    float vf1 = static_cast<float>(v_src[d1]) * v_sinv;
-#endif
+    float vf0 = v_smem[d0] * v_sinv;
+    float vf1 = v_smem[d1] * v_sinv;
     uint8_t vn0 = fp4_e2m1_quantize_nibble(vf0);
     uint8_t vn1 = fp4_e2m1_quantize_nibble(vf1);
     v_dst[j] = (vn0 & 0xF) | ((vn1 & 0xF) << 4);

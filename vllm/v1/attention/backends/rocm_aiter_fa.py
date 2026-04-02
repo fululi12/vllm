@@ -876,6 +876,10 @@ _FP4_PCK_MAX_BLOCK_RATIO = float(
 )
 
 
+_FP4_RT_BOUNDARIES_CACHE: dict[torch.device, torch.Tensor] = {}
+_FP4_RT_VALUES_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
 def _fp4_round_trip(x: torch.Tensor) -> torch.Tensor:
     """Simulate FP4 E2M1 quantize-then-dequant in float32.
 
@@ -883,16 +887,23 @@ def _fp4_round_trip(x: torch.Tensor) -> torch.Tensor:
     Each value is mapped to the nearest representable magnitude,
     preserving sign.
     """
+    dev = x.device
+    boundaries = _FP4_RT_BOUNDARIES_CACHE.get(dev)
+    if boundaries is None:
+        boundaries = torch.tensor(
+            [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+            device=dev, dtype=torch.float32,
+        )
+        _FP4_RT_BOUNDARIES_CACHE[dev] = boundaries
+    values = _FP4_RT_VALUES_CACHE.get(dev)
+    if values is None:
+        values = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+            device=dev, dtype=torch.float32,
+        )
+        _FP4_RT_VALUES_CACHE[dev] = values
     sign = x.sign()
     ax = x.abs()
-    boundaries = torch.tensor(
-        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
-        device=x.device, dtype=torch.float32,
-    )
-    values = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-        device=x.device, dtype=torch.float32,
-    )
     idx = torch.bucketize(ax, boundaries)
     return sign * values[idx]
 
@@ -1057,6 +1068,35 @@ def get_fp4_per_token_kscale(
 
 
 FP4_QUANT_BLOCK_SIZE = 32
+
+_FP4_E2M1_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
+_FP4_BM_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_fp4_e2m1_lut(device: torch.device) -> torch.Tensor:
+    """Return the cached E2M1 dequant LUT for *device*."""
+    lut = _FP4_E2M1_LUT_CACHE.get(device)
+    if lut is None:
+        lut = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            dtype=torch.float32, device=device,
+        )
+        _FP4_E2M1_LUT_CACHE[device] = lut
+    return lut
+
+
+def _get_fp4_bm_lut(device: torch.device) -> torch.Tensor:
+    """Return the cached AMXFP4 block-maximum LUT for *device*."""
+    lut = _FP4_BM_LUT_CACHE.get(device)
+    if lut is None:
+        lut = torch.tensor(
+            [4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5,
+             -4.0, -4.5, -5.0, -5.5, -6.0, -6.5, -7.0, -7.5],
+            dtype=torch.float32, device=device,
+        )
+        _FP4_BM_LUT_CACHE[device] = lut
+    return lut
 
 
 def _get_or_create_fp4_pertoken_scales(
@@ -1578,14 +1618,7 @@ if current_platform.is_rocm():
         packed_k = kc_u8[block_id, slot_id]
         packed_v = vc_u8[block_id, slot_id]
 
-        # FP4 E2M1 dequantization: nibble → float via lookup table.
-        # Use float32 for all intermediate math to avoid bf16/fp16
-        # rounding during scale multiplication.
-        lut = torch.tensor(
-            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-             0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-            dtype=torch.float32, device=key.device,
-        )
+        lut = _get_fp4_e2m1_lut(key.device)
 
         k_lo = (packed_k & 0x0F).long()
         k_hi = ((packed_k >> 4) & 0x0F).long()
@@ -1635,15 +1668,14 @@ if current_platform.is_rocm():
                     k_sc_float = k_sc_float.reshape(
                         num_heads, num_k_blocks, total_tokens
                     ).permute(2, 0, 1)
-                    k_scales = k_sc_float.repeat_interleave(
-                        FP4_QUANT_BLOCK_SIZE, dim=-1)
-                    k_out = k_out * k_scales
+                    k_out = (
+                        k_out.view(
+                            total_tokens, num_heads,
+                            num_k_blocks, FP4_QUANT_BLOCK_SIZE)
+                        * k_sc_float.unsqueeze(-1)
+                    ).reshape(total_tokens, num_heads, head_dim)
 
-                    bm_lut = torch.tensor(
-                        [4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5,
-                         -4.0, -4.5, -5.0, -5.5, -6.0, -6.5, -7.0,
-                         -7.5],
-                        dtype=torch.float32, device=key.device)
+                    bm_lut = _get_fp4_bm_lut(key.device)
                     k_bm_idx = k_bm_raw.reshape(
                         num_heads, num_k_blocks, total_tokens
                     ).permute(2, 0, 1).long()
@@ -1689,9 +1721,12 @@ if current_platform.is_rocm():
                     k_sc_float = k_sc_float.reshape(
                         num_heads, num_k_blocks, total_tokens
                     ).permute(2, 0, 1)
-                    k_scales = k_sc_float.repeat_interleave(
-                        FP4_QUANT_BLOCK_SIZE, dim=-1)
-                    k_out = k_out * k_scales
+                    k_out = (
+                        k_out.view(
+                            total_tokens, num_heads,
+                            num_k_blocks, FP4_QUANT_BLOCK_SIZE)
+                        * k_sc_float.unsqueeze(-1)
+                    ).reshape(total_tokens, num_heads, head_dim)
             else:
                 num_k_blocks = k_dequant_scales_2d.shape[0] // num_heads
                 if num_k_blocks > 1:
@@ -1699,10 +1734,12 @@ if current_platform.is_rocm():
                     k_sc = k_sc.reshape(
                         num_heads, num_k_blocks, total_tokens
                     ).permute(2, 0, 1)
-                    k_scales = k_sc.repeat_interleave(
-                        FP4_QUANT_BLOCK_SIZE, dim=-1
-                    )
-                    k_out = k_out * k_scales
+                    k_out = (
+                        k_out.view(
+                            total_tokens, num_heads,
+                            num_k_blocks, FP4_QUANT_BLOCK_SIZE)
+                        * k_sc.unsqueeze(-1)
+                    ).reshape(total_tokens, num_heads, head_dim)
                 else:
                     k_scales = k_dequant_scales_2d[:, physical_slot_idx]
                     k_scales = k_scales.T.unsqueeze(-1)
@@ -1730,15 +1767,14 @@ if current_platform.is_rocm():
                     v_sc_float = v_sc_float.reshape(
                         num_heads, num_v_blocks, total_tokens
                     ).permute(2, 0, 1)
-                    v_scales = v_sc_float.repeat_interleave(
-                        FP4_QUANT_BLOCK_SIZE, dim=-1)
-                    v_out = v_out * v_scales
+                    v_out = (
+                        v_out.view(
+                            total_tokens, num_heads,
+                            num_v_blocks, FP4_QUANT_BLOCK_SIZE)
+                        * v_sc_float.unsqueeze(-1)
+                    ).reshape(total_tokens, num_heads, head_dim)
 
-                    bm_lut_v = torch.tensor(
-                        [4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5,
-                         -4.0, -4.5, -5.0, -5.5, -6.0, -6.5, -7.0,
-                         -7.5],
-                        dtype=torch.float32, device=key.device)
+                    bm_lut_v = _get_fp4_bm_lut(key.device)
                     v_bm_idx = v_bm_raw.reshape(
                         num_heads, num_v_blocks, total_tokens
                     ).permute(2, 0, 1).long()
@@ -1784,9 +1820,12 @@ if current_platform.is_rocm():
                     v_sc_float = v_sc_float.reshape(
                         num_heads, num_v_blocks, total_tokens
                     ).permute(2, 0, 1)
-                    v_scales = v_sc_float.repeat_interleave(
-                        FP4_QUANT_BLOCK_SIZE, dim=-1)
-                    v_out = v_out * v_scales
+                    v_out = (
+                        v_out.view(
+                            total_tokens, num_heads,
+                            num_v_blocks, FP4_QUANT_BLOCK_SIZE)
+                        * v_sc_float.unsqueeze(-1)
+                    ).reshape(total_tokens, num_heads, head_dim)
             else:
                 num_v_blocks = v_dequant_scales_2d.shape[0] // num_heads
                 if num_v_blocks > 1:
@@ -1794,10 +1833,12 @@ if current_platform.is_rocm():
                     v_sc = v_sc.reshape(
                         num_heads, num_v_blocks, total_tokens
                     ).permute(2, 0, 1)
-                    v_scales = v_sc.repeat_interleave(
-                        FP4_QUANT_BLOCK_SIZE, dim=-1
-                    )
-                    v_out = v_out * v_scales
+                    v_out = (
+                        v_out.view(
+                            total_tokens, num_heads,
+                            num_v_blocks, FP4_QUANT_BLOCK_SIZE)
+                        * v_sc.unsqueeze(-1)
+                    ).reshape(total_tokens, num_heads, head_dim)
                 else:
                     v_scales = v_dequant_scales_2d[:, physical_slot_idx]
                     v_scales = v_scales.T.unsqueeze(-1)
@@ -3010,7 +3051,18 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             v_2d.dtype, list(v_2d.shape),
                             cache_key.shape[0], head_size,
                         )
-                    if _is_capturing:
+                    _default_cpp_ok = getattr(
+                        layer, "_fp4_default_cpp_validated",
+                        None)
+                    if _default_cpp_ok is False:
+                        _fp4_default_python_write(
+                            cache_key, cache_value,
+                            key_cache, value_cache,
+                            k_2d, v_2d,
+                            attn_metadata.slot_mapping,
+                            head_size,
+                        )
+                    elif _is_capturing or _default_cpp_ok:
                         torch.ops._C_cache_ops \
                             .reshape_and_cache_flash_with_pertoken_quant(
                                 cache_key,
@@ -3023,7 +3075,6 @@ class AiterFlashAttentionImpl(AttentionImpl):
                                 self.kv_cache_dtype,
                             )
                     else:
-                        _default_use_python = False
                         try:
                             torch.ops._C_cache_ops \
                                 .reshape_and_cache_flash_with_pertoken_quant(
@@ -3038,30 +3089,46 @@ class AiterFlashAttentionImpl(AttentionImpl):
                                 )
                             valid_slots = \
                                 attn_metadata.slot_mapping[
-                                    attn_metadata.slot_mapping >= 0]
+                                    attn_metadata.slot_mapping
+                                    >= 0]
                             if valid_slots.numel() > 0:
                                 torch.cuda.current_stream(
                                     key_cache.device
                                 ).synchronize()
                                 sample = k_2d[
                                     0, valid_slots[:min(
-                                        32, valid_slots.numel()
+                                        32,
+                                        valid_slots.numel()
                                     )]]
-                                if sample.abs().sum().item() == 0:
+                                if (sample.abs().sum()
+                                        .item() == 0):
                                     logger.warning(
                                         "Default FP4 C++ write "
-                                        "kernel produced all-zero "
-                                        "scales (%d samples). "
-                                        "Falling back to Python.",
+                                        "kernel produced "
+                                        "all-zero scales "
+                                        "(%d samples). "
+                                        "Falling back to "
+                                        "Python permanently.",
                                         sample.numel())
-                                    _default_use_python = True
+                                    layer._fp4_default_cpp_validated\
+                                        = False
+                                else:
+                                    layer._fp4_default_cpp_validated\
+                                        = True
+                            else:
+                                layer._fp4_default_cpp_validated\
+                                    = True
                         except Exception as e:
                             logger.warning(
-                                "Default FP4 C++ write kernel "
-                                "failed: %s. Using Python "
-                                "fallback.", e)
-                            _default_use_python = True
-                        if _default_use_python:
+                                "Default FP4 C++ write "
+                                "kernel failed: %s. "
+                                "Using Python fallback "
+                                "permanently.", e)
+                            layer._fp4_default_cpp_validated\
+                                = False
+                        if _default_cpp_ok is None \
+                                and layer._fp4_default_cpp_validated\
+                                is False:
                             _fp4_default_python_write(
                                 cache_key, cache_value,
                                 key_cache, value_cache,
