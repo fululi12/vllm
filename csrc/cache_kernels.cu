@@ -864,17 +864,12 @@ __inline__ __device__ float fp4_wht_sign(int dim_idx) {
 // sign(bit3) | magnitude(bits 2:0) mapping to
 // {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}.
 __inline__ __device__ uint8_t fp4_e2m1_quantize_nibble(float x) {
-  uint8_t sign = (x < 0.0f) ? 8 : 0;
+  uint8_t sign = (x < 0.0f) ? 8u : 0u;
   float a = fabsf(x);
-  uint8_t mag;
-  if      (a < 0.25f) mag = 0;
-  else if (a < 0.75f) mag = 1;
-  else if (a < 1.25f) mag = 2;
-  else if (a < 1.75f) mag = 3;
-  else if (a < 2.5f)  mag = 4;
-  else if (a < 3.5f)  mag = 5;
-  else if (a < 5.0f)  mag = 6;
-  else                mag = 7;
+  uint8_t mag = (uint8_t)(a >= 0.25f) + (uint8_t)(a >= 0.75f)
+              + (uint8_t)(a >= 1.25f) + (uint8_t)(a >= 1.75f)
+              + (uint8_t)(a >= 2.5f)  + (uint8_t)(a >= 3.5f)
+              + (uint8_t)(a >= 5.0f);
   return sign | mag;
 }
 
@@ -1441,15 +1436,15 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
       (num_k_quant_blocks > 1) ? (k_scale_stride_h / num_k_quant_blocks) : 0;
   const int64_t v_blk_stride =
       (num_v_quant_blocks > 1) ? (v_scale_stride_h / num_v_quant_blocks) : 0;
-  if (lane_id == 0) {
-    for (int b = 0; b < num_k_quant_blocks; b++) {
-      k_dequant_scales[head_idx * k_scale_stride_h
-                       + b * k_blk_stride + slot_idx] = k_block_scale[b];
-    }
-    for (int b = 0; b < num_v_quant_blocks; b++) {
-      v_dequant_scales[head_idx * v_scale_stride_h
-                       + b * v_blk_stride + slot_idx] = v_block_scale[b];
-    }
+  if (lane_id < num_k_quant_blocks) {
+    k_dequant_scales[head_idx * k_scale_stride_h
+                     + lane_id * k_blk_stride + slot_idx] =
+        k_block_scale[lane_id];
+  }
+  if (lane_id < num_v_quant_blocks) {
+    v_dequant_scales[head_idx * v_scale_stride_h
+                     + lane_id * v_blk_stride + slot_idx] =
+        v_block_scale[lane_id];
   }
 
   // --- Pass 2: quantize to FP4 E2M1, pack pairs, write to cache -------------
