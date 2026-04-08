@@ -758,7 +758,7 @@ namespace vllm {
 // ---------------------------------------------------------------------------
 // Per-block-specific accuracy tuning.
 //
-// These control outlier clipping and MSE refinement for per-block-32 paths
+// These control outlier clipping and MSE refinement for per-block paths
 // independently from the per-token flags.  Per-block quantization benefits
 // MORE from these optimizations because each block has only 32 elements:
 // a single outlier can waste 1/32 of the dynamic range vs 1/128 for
@@ -1073,8 +1073,8 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
     const scalar_t* __restrict__ value,       // [num_tokens, num_heads, head_size]
     uint8_t* __restrict__ key_cache,          // [num_blocks, block_size, num_heads, head_size/2]
     uint8_t* __restrict__ value_cache,        // [num_blocks, block_size, num_heads, head_size/2]
-    float* __restrict__ k_dequant_scales,     // [num_heads * num_k_quant_blocks, max_kv_tokens]
-    float* __restrict__ v_dequant_scales,     // [num_heads * num_v_quant_blocks, max_kv_tokens]
+    uint8_t* __restrict__ k_dequant_scales,     // [num_heads * num_k_quant_blocks, max_kv_tokens] FP8 E4M3
+    uint8_t* __restrict__ v_dequant_scales,     // [num_heads * num_v_quant_blocks, max_kv_tokens] FP8 E4M3
     const int64_t* __restrict__ slot_mapping, // [num_tokens]
     const int64_t key_stride,
     const int64_t value_stride,
@@ -1431,6 +1431,21 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
     k_block_scale_inv[0] = 1.0f / k_block_scale[0];
   }
 
+  // --- FP8 round-trip: ensure quantisation uses the rounded scale -----------
+  // float_to_fp8_e4m3 rounds the ideal scale to the nearest FP8 E4M3 value.
+  // We must use this rounded value for the inverse so that quantisation
+  // (Pass 2) and dequantisation (PA kernel / gather) are consistent.
+  for (int b = 0; b < num_k_quant_blocks; b++) {
+    float rounded = fp8_e4m3_to_float(float_to_fp8_e4m3(k_block_scale[b]));
+    k_block_scale[b] = rounded;
+    k_block_scale_inv[b] = 1.0f / fmaxf(rounded, 1e-30f);
+  }
+  for (int b = 0; b < num_v_quant_blocks; b++) {
+    float rounded = fp8_e4m3_to_float(float_to_fp8_e4m3(v_block_scale[b]));
+    v_block_scale[b] = rounded;
+    v_block_scale_inv[b] = 1.0f / fmaxf(rounded, 1e-30f);
+  }
+
   // --- Store scales ----------------------------------------------------------
   const int64_t k_blk_stride =
       (num_k_quant_blocks > 1) ? (k_scale_stride_h / num_k_quant_blocks) : 0;
@@ -1439,12 +1454,12 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
   if (lane_id < num_k_quant_blocks) {
     k_dequant_scales[head_idx * k_scale_stride_h
                      + lane_id * k_blk_stride + slot_idx] =
-        k_block_scale[lane_id];
+        float_to_fp8_e4m3(k_block_scale[lane_id]);
   }
   if (lane_id < num_v_quant_blocks) {
     v_dequant_scales[head_idx * v_scale_stride_h
                      + lane_id * v_blk_stride + slot_idx] =
-        v_block_scale[lane_id];
+        float_to_fp8_e4m3(v_block_scale[lane_id]);
   }
 
   // --- Pass 2: quantize to FP4 E2M1, pack pairs, write to cache -------------
@@ -2470,8 +2485,227 @@ __global__ void reshape_and_cache_flash_fp4_amxfp4_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fused FP4 gather + E2M1 dequant + block-32 scale application kernel.
+// Replaces ~26 separate PyTorch kernel launches in the Python gather path
+// with a single GPU kernel.  Grid = (total_tokens, num_heads),
+// Block = (packed_dim).  Each thread handles one packed byte (2 FP4 elems)
+// for both K and V caches.
+//
+// Templated on scalar_t (output dtype: bf16/fp16/float) and index_t
+// (int32 or int64) to accept index tensors directly without Python-side
+// .long() conversions — saving 4 kernel launches per call.
+//
+// For bf16/fp16, consecutive element pairs are written via a single 32-bit
+// store (vectorized write) to halve the store instruction count.
+// ---------------------------------------------------------------------------
+template <typename scalar_t, typename index_t>
+__global__ void fp4_gather_dequant_scale_kernel(
+    const uint8_t* __restrict__ key_cache,
+    const uint8_t* __restrict__ value_cache,
+    scalar_t* __restrict__ key_out,
+    scalar_t* __restrict__ value_out,
+    const index_t* __restrict__ token_to_batch,
+    const index_t* __restrict__ seq_starts,
+    const index_t* __restrict__ cu_seqlens_kv,
+    const index_t* __restrict__ block_tables,
+    const uint8_t* __restrict__ k_scales,
+    const uint8_t* __restrict__ v_scales,
+    const int total_tokens,
+    const int page_size,
+    const int bt_stride0,
+    const int num_heads,
+    const int packed_dim,
+    const int head_dim,
+    const int num_scale_blocks,
+    const int scale_total_tokens) {
+
+  constexpr float E2M1[16] = {
+      0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+      0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+
+  const int tok_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int byte_idx = threadIdx.x;
+
+  if (tok_idx >= total_tokens || byte_idx >= packed_dim) return;
+
+  const int batch = static_cast<int>(token_to_batch[tok_idx]);
+  const int b_start = static_cast<int>(seq_starts[batch]);
+  const int t_start = static_cast<int>(cu_seqlens_kv[batch]);
+  int offset = tok_idx - t_start + b_start;
+  int blk_off = offset / page_size;
+  int slot = offset - blk_off * page_size;
+  const int max_blk = bt_stride0 - 1;
+  blk_off = (blk_off < 0) ? 0 : ((blk_off > max_blk) ? max_blk : blk_off);
+  const int block_id = static_cast<int>(
+      block_tables[static_cast<int64_t>(batch) * bt_stride0 + blk_off]);
+  const int phys_slot = slot + block_id * page_size;
+
+  const int64_t cache_idx =
+      (static_cast<int64_t>(block_id) * page_size + slot) *
+          static_cast<int64_t>(num_heads) * packed_dim +
+      static_cast<int64_t>(head_idx) * packed_dim + byte_idx;
+  const uint8_t k_byte = key_cache[cache_idx];
+  const uint8_t v_byte = value_cache[cache_idx];
+
+  float k_lo = E2M1[k_byte & 0x0F];
+  float k_hi = E2M1[(k_byte >> 4) & 0x0F];
+  float v_lo = E2M1[v_byte & 0x0F];
+  float v_hi = E2M1[(v_byte >> 4) & 0x0F];
+
+  const int elem_lo = byte_idx * 2;
+  const int blk_lo = elem_lo >> 5;
+  const int blk_hi = (elem_lo + 1) >> 5;
+  const int64_t sh = static_cast<int64_t>(head_idx) * num_scale_blocks *
+                     scale_total_tokens;
+
+  float k_s_lo = fp8_e4m3_to_float(
+      k_scales[sh + static_cast<int64_t>(blk_lo) * scale_total_tokens +
+               phys_slot]);
+  float v_s_lo = fp8_e4m3_to_float(
+      v_scales[sh + static_cast<int64_t>(blk_lo) * scale_total_tokens +
+               phys_slot]);
+  k_lo *= k_s_lo;
+  v_lo *= v_s_lo;
+
+  if (blk_lo == blk_hi) {
+    k_hi *= k_s_lo;
+    v_hi *= v_s_lo;
+  } else {
+    float k_s_hi = fp8_e4m3_to_float(
+        k_scales[sh + static_cast<int64_t>(blk_hi) * scale_total_tokens +
+                 phys_slot]);
+    float v_s_hi = fp8_e4m3_to_float(
+        v_scales[sh + static_cast<int64_t>(blk_hi) * scale_total_tokens +
+                 phys_slot]);
+    k_hi *= k_s_hi;
+    v_hi *= v_s_hi;
+  }
+
+  const int64_t out_base =
+      (static_cast<int64_t>(tok_idx) * num_heads + head_idx) *
+      static_cast<int64_t>(head_dim);
+
+  if constexpr (sizeof(scalar_t) == 2) {
+    scalar_t k_pair[2] = {static_cast<scalar_t>(k_lo),
+                          static_cast<scalar_t>(k_hi)};
+    scalar_t v_pair[2] = {static_cast<scalar_t>(v_lo),
+                          static_cast<scalar_t>(v_hi)};
+    *reinterpret_cast<uint32_t*>(&key_out[out_base + elem_lo]) =
+        *reinterpret_cast<const uint32_t*>(k_pair);
+    *reinterpret_cast<uint32_t*>(&value_out[out_base + elem_lo]) =
+        *reinterpret_cast<const uint32_t*>(v_pair);
+  } else {
+    key_out[out_base + elem_lo] = static_cast<scalar_t>(k_lo);
+    key_out[out_base + elem_lo + 1] = static_cast<scalar_t>(k_hi);
+    value_out[out_base + elem_lo] = static_cast<scalar_t>(v_lo);
+    value_out[out_base + elem_lo + 1] = static_cast<scalar_t>(v_hi);
+  }
+}
+
 }  // namespace vllm
 #endif  // USE_ROCM
+
+// ---------------------------------------------------------------------------
+// FP4 fused gather + dequant + scale dispatch.
+// ---------------------------------------------------------------------------
+void fp4_gather_dequant_kv(
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    torch::Tensor& key_out,
+    torch::Tensor& value_out,
+    torch::Tensor& token_to_batch,
+    torch::Tensor& seq_starts,
+    torch::Tensor& cu_seqlens_kv,
+    torch::Tensor& block_tables,
+    torch::Tensor& k_scales,
+    torch::Tensor& v_scales,
+    int64_t total_tokens) {
+#ifdef USE_ROCM
+  TORCH_CHECK(key_cache.dim() == 4,
+              "fp4_gather_dequant_kv: key_cache must be 4D");
+  TORCH_CHECK(total_tokens > 0,
+              "fp4_gather_dequant_kv: total_tokens must be > 0");
+
+  const int page_size = key_cache.size(1);
+  const int num_heads = key_cache.size(2);
+  const int packed_dim = key_cache.size(3);
+  const int head_dim = packed_dim * 2;
+  const int num_scale_blocks = head_dim / 32;
+  const int scale_total_tokens =
+      static_cast<int>(key_cache.size(0)) * page_size;
+  const int bt_stride0 = block_tables.size(1);
+
+  const dim3 grid(static_cast<int>(total_tokens), num_heads);
+  const dim3 block(packed_dim);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key_cache));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const bool all_int32 =
+      (token_to_batch.scalar_type() == at::kInt &&
+       seq_starts.scalar_type() == at::kInt &&
+       cu_seqlens_kv.scalar_type() == at::kInt &&
+       block_tables.scalar_type() == at::kInt);
+
+  torch::Tensor t2b_t, ss_t, cs_t, bt_t;
+  if (!all_int32) {
+    t2b_t = token_to_batch.to(at::kLong);
+    ss_t  = seq_starts.to(at::kLong);
+    cs_t  = cu_seqlens_kv.to(at::kLong);
+    bt_t  = block_tables.to(at::kLong);
+  }
+
+#define LAUNCH_GATHER_KERNEL(stype, itype, t2b_ref, ss_ref, cs_ref, bt_ref) \
+  vllm::fp4_gather_dequant_scale_kernel<stype, itype> \
+      <<<grid, block, 0, stream>>>( \
+          key_cache.data_ptr<uint8_t>(), \
+          value_cache.data_ptr<uint8_t>(), \
+          reinterpret_cast<stype*>(key_out.data_ptr()), \
+          reinterpret_cast<stype*>(value_out.data_ptr()), \
+          (t2b_ref).data_ptr<itype>(), \
+          (ss_ref).data_ptr<itype>(), \
+          (cs_ref).data_ptr<itype>(), \
+          (bt_ref).data_ptr<itype>(), \
+          reinterpret_cast<const uint8_t*>(k_scales.data_ptr()), \
+          reinterpret_cast<const uint8_t*>(v_scales.data_ptr()), \
+          static_cast<int>(total_tokens), \
+          page_size, bt_stride0, num_heads, packed_dim, head_dim, \
+          num_scale_blocks, scale_total_tokens)
+
+  if (key_out.dtype() == at::ScalarType::Half) {
+    if (all_int32) {
+      LAUNCH_GATHER_KERNEL(uint16_t, int32_t,
+          token_to_batch, seq_starts, cu_seqlens_kv, block_tables);
+    } else {
+      LAUNCH_GATHER_KERNEL(uint16_t, int64_t,
+          t2b_t, ss_t, cs_t, bt_t);
+    }
+  } else if (key_out.dtype() == at::ScalarType::BFloat16) {
+    if (all_int32) {
+      LAUNCH_GATHER_KERNEL(__nv_bfloat16, int32_t,
+          token_to_batch, seq_starts, cu_seqlens_kv, block_tables);
+    } else {
+      LAUNCH_GATHER_KERNEL(__nv_bfloat16, int64_t,
+          t2b_t, ss_t, cs_t, bt_t);
+    }
+  } else if (key_out.dtype() == at::ScalarType::Float) {
+    if (all_int32) {
+      LAUNCH_GATHER_KERNEL(float, int32_t,
+          token_to_batch, seq_starts, cu_seqlens_kv, block_tables);
+    } else {
+      LAUNCH_GATHER_KERNEL(float, int64_t,
+          t2b_t, ss_t, cs_t, bt_t);
+    }
+  } else {
+    TORCH_CHECK(false, "fp4_gather_dequant_kv: unsupported output dtype: ",
+                key_out.dtype());
+  }
+#undef LAUNCH_GATHER_KERNEL
+#else
+  TORCH_CHECK(false, "fp4_gather_dequant_kv is only supported on ROCm");
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // Per-channel-K / per-token-V FP4 cache write dispatch.
@@ -2940,8 +3174,8 @@ void reshape_and_cache_flash_with_pertoken_quant(
           reinterpret_cast<scalar_type*>(value.data_ptr()), \
           reinterpret_cast<uint8_t*>(key_cache.data_ptr()), \
           reinterpret_cast<uint8_t*>(value_cache.data_ptr()), \
-          k_dequant_scales.data_ptr<float>(), \
-          v_dequant_scales.data_ptr<float>(), \
+          reinterpret_cast<uint8_t*>(k_dequant_scales.data_ptr()), \
+          reinterpret_cast<uint8_t*>(v_dequant_scales.data_ptr()), \
           slot_mapping.data_ptr<int64_t>(), \
           key_stride, value_stride, head_size, block_size, num_blocks, \
           block_stride, page_stride, head_stride, \

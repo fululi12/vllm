@@ -211,7 +211,7 @@ logger.info(
      "NVFP4" if _FP4_NVFP4 else
      "MXFP4" if _FP4_MXFP4 else
      "PER_CHANNEL_K" if _FP4_PER_CHANNEL_K else
-     "DEFAULT (per-block-32 float32 scales)"),
+     "DEFAULT (per-block-32 FP8 E4M3 scales)"),
 )
 _NVFP4_NATIVE_VALIDATION_PASSES = 0
 _NVFP4_NATIVE_VALIDATION_REQUIRED = 3
@@ -228,26 +228,21 @@ def _fp4_e2m1_quantize_tensor(x: torch.Tensor) -> torch.Tensor:
     E2M1 representable magnitudes: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}.
     Input is expected to be pre-normalized by the block scale (values in
     roughly [-6, +6]).
+
+    Uses branchless sum-of-comparisons (matching the C++ kernel) to
+    reduce kernel launches and memory traffic vs. 8 separate torch.where
+    calls.
     """
     sign = (x < 0).to(torch.uint8) * 8
     a = x.abs()
-    nibble = torch.zeros_like(a, dtype=torch.uint8)
-    nibble = torch.where(a < 0.25, torch.zeros_like(nibble), nibble)
-    nibble = torch.where((a >= 0.25) & (a < 0.75),
-                         torch.ones_like(nibble), nibble)
-    nibble = torch.where((a >= 0.75) & (a < 1.25),
-                         torch.full_like(nibble, 2), nibble)
-    nibble = torch.where((a >= 1.25) & (a < 1.75),
-                         torch.full_like(nibble, 3), nibble)
-    nibble = torch.where((a >= 1.75) & (a < 2.5),
-                         torch.full_like(nibble, 4), nibble)
-    nibble = torch.where((a >= 2.5) & (a < 3.5),
-                         torch.full_like(nibble, 5), nibble)
-    nibble = torch.where((a >= 3.5) & (a < 5.0),
-                         torch.full_like(nibble, 6), nibble)
-    nibble = torch.where(a >= 5.0,
-                         torch.full_like(nibble, 7), nibble)
-    return sign | nibble
+    mag = ((a >= 0.25).to(torch.uint8)
+           + (a >= 0.75).to(torch.uint8)
+           + (a >= 1.25).to(torch.uint8)
+           + (a >= 1.75).to(torch.uint8)
+           + (a >= 2.5).to(torch.uint8)
+           + (a >= 3.5).to(torch.uint8)
+           + (a >= 5.0).to(torch.uint8))
+    return sign | mag
 
 
 def _nvfp4_write_cache_python(
@@ -636,8 +631,15 @@ def _fp4_default_python_write(
         b_idx = hb % num_blocks
         base = h_idx * stride_h + b_idx * total_tokens
         flat_idx = base.unsqueeze(0) + valid_slots.unsqueeze(1)
-        s_2d.view(-1).scatter_(
-            0, flat_idx.reshape(-1), scales_flat.reshape(-1))
+        if s_2d.dtype == torch.uint8:
+            scales_bytes = _float_to_fp8_e4m3(
+                scales_flat.reshape(-1))
+            s_2d.view(-1).scatter_(
+                0, flat_idx.reshape(-1), scales_bytes)
+        else:
+            s_2d.view(-1).scatter_(
+                0, flat_idx.reshape(-1),
+                scales_flat.to(s_2d.dtype).reshape(-1))
 
 
 def _nvfp4_write_cache(
@@ -923,8 +925,8 @@ def _compute_k_channel_scales(
         mse_iters: MSE-optimal refinement iterations
         safety_margin: multiplicative safety margin (>= 1.0)
         max_block_ratio: maximum allowed ratio between scales within
-            a quantization block of 32.  Prevents extreme dynamic range
-            within blocks that destroys per-block-32 FP4 precision.
+            a quantization block.  Prevents extreme dynamic range
+            within blocks that destroys per-block FP4 precision.
 
     Returns:
         k_channel_scales: [num_kv_heads, head_size] float32
@@ -1069,8 +1071,13 @@ def get_fp4_per_token_kscale(
 
 FP4_QUANT_BLOCK_SIZE = 32
 
+_FP4_CPP_GATHER_OK: bool | None = None
+_FP4_ARANGE_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
+
 _FP4_E2M1_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
 _FP4_BM_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
+_FP4_BYTE_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
+_FP4_BYTE_LUT_TYPED_CACHE: dict[tuple, torch.Tensor] = {}
 
 
 def _get_fp4_e2m1_lut(device: torch.device) -> torch.Tensor:
@@ -1083,6 +1090,45 @@ def _get_fp4_e2m1_lut(device: torch.device) -> torch.Tensor:
             dtype=torch.float32, device=device,
         )
         _FP4_E2M1_LUT_CACHE[device] = lut
+    return lut
+
+
+def _get_fp4_byte_lut(device: torch.device) -> torch.Tensor:
+    """Return a cached 256-entry byte LUT that maps each packed uint8 byte
+    to its two dequantized float32 values ``[lo_nibble, hi_nibble]``.
+
+    Shape: ``[256, 2]``  dtype: ``float32``
+
+    Using this LUT replaces 6 separate PyTorch kernel launches per
+    cache type (mask, shift, mask, LUT, LUT, strided-write) with a
+    single advanced-indexing + contiguous reshape.
+    """
+    lut = _FP4_BYTE_LUT_CACHE.get(device)
+    if lut is None:
+        e2m1 = _get_fp4_e2m1_lut(device)
+        all_bytes = torch.arange(256, device=device, dtype=torch.long)
+        lo = e2m1[all_bytes & 0x0F]
+        hi = e2m1[(all_bytes >> 4) & 0x0F]
+        lut = torch.stack([lo, hi], dim=1)  # [256, 2]
+        _FP4_BYTE_LUT_CACHE[device] = lut
+    return lut
+
+
+def _get_fp4_byte_lut_typed(
+    device: torch.device, dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return the 256-entry byte LUT cast to *dtype* (bf16/fp16).
+
+    All FP4 E2M1 dequant values ({0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6})
+    are exactly representable in bf16 and fp16, so there is zero precision
+    loss.  Keeping intermediates in the model's native dtype halves HBM
+    traffic for the gather+dequant+scale pipeline.
+    """
+    key = (device, dtype)
+    lut = _FP4_BYTE_LUT_TYPED_CACHE.get(key)
+    if lut is None:
+        lut = _get_fp4_byte_lut(device).to(dtype)
+        _FP4_BYTE_LUT_TYPED_CACHE[key] = lut
     return lut
 
 
@@ -1099,6 +1145,24 @@ def _get_fp4_bm_lut(device: torch.device) -> torch.Tensor:
     return lut
 
 
+def _get_cached_arange(
+    size: int, device: torch.device,
+) -> torch.Tensor:
+    """Return a cached ``torch.arange(size)`` on *device*.
+
+    Grows the cached tensor if *size* exceeds the previous maximum.
+    Avoids a GPU kernel launch for every gather call.
+    """
+    key = device
+    cached = _FP4_ARANGE_CACHE.get(key)
+    if cached is not None and cached.numel() >= size:
+        return cached[:size]
+    new_size = max(size, 8192)
+    t = torch.arange(new_size, device=device, dtype=torch.int64)
+    _FP4_ARANGE_CACHE[key] = t
+    return t[:size]
+
+
 def _get_or_create_fp4_pertoken_scales(
     layer: torch.nn.Module,
     num_kv_heads: int,
@@ -1106,9 +1170,10 @@ def _get_or_create_fp4_pertoken_scales(
     device,
     head_size: int = 128,
 ):
-    """Allocate (once) per-block K and V dequant-scale buffers.
+    """Allocate (once) per-block K and V dequant-scale buffers (FP8 E4M3).
 
-    Both K and V use per-block-32 quantization scales.  The layout is::
+    Both K and V use per-block-32 quantization scales stored as FP8 E4M3
+    (uint8).  The layout is::
 
         [num_kv_heads * num_blocks, total_tokens]
 
@@ -1132,11 +1197,11 @@ def _get_or_create_fp4_pertoken_scales(
     num_v_blocks = max(1, head_size // FP4_QUANT_BLOCK_SIZE)
 
     k_flat_size = num_kv_heads * num_k_blocks * total_tokens
-    k_flat = torch.zeros(k_flat_size, dtype=torch.float32, device=device)
+    k_flat = torch.zeros(k_flat_size, dtype=torch.uint8, device=device)
     k_2d = k_flat.view(num_kv_heads * num_k_blocks, total_tokens)
 
     v_flat_size = num_kv_heads * num_v_blocks * total_tokens
-    v_flat = torch.zeros(v_flat_size, dtype=torch.float32, device=device)
+    v_flat = torch.zeros(v_flat_size, dtype=torch.uint8, device=device)
     v_2d = v_flat.view(num_kv_heads * num_v_blocks, total_tokens)
 
     layer._fp4_k_dequant_scales_flat = k_flat
@@ -1574,6 +1639,275 @@ if current_platform.is_rocm():
                 tl.store(key_ptr_offset + col_offsets + i, k_reg, mask=mask)
                 tl.store(value_ptr_offset + col_offsets + i, v_reg, mask=mask)
 
+    # ----------------------------------------------------------------
+    # Fused Triton kernel: gather + FP4-dequant + block-32-scale
+    # Replaces ~20 separate PyTorch kernel launches with 1.
+    # Grid: (total_tokens, num_heads) — one program per token×head.
+    # ----------------------------------------------------------------
+    _FP4_TRITON_OK: bool | None = False  # disabled: AMD/ROCm Triton may miscompile
+
+    @triton.jit
+    def _fp4_fused_gather_dequant_kernel(
+        kc_ptr, vc_ptr,
+        k_sc_ptr, v_sc_ptr,
+        t2b_ptr, ss_ptr, csq_ptr, bt_ptr,
+        lut_ptr,
+        k_out_ptr, v_out_ptr,
+        num_heads,
+        packed_dim,
+        page_size,
+        max_block_num,
+        bt_stride0,
+        sc_stride0,
+        out_stride_tok,
+        out_stride_head,
+        HEAD_DIM: tl.constexpr,
+        QUANT_BLK: tl.constexpr,
+        N_SC_BLKS: tl.constexpr,
+        IS_BF16: tl.constexpr,
+    ):
+        tid = tl.program_id(0).to(tl.int64)
+        hid = tl.program_id(1).to(tl.int64)
+
+        bidx = tl.load(t2b_ptr + tid).to(tl.int64)
+        bstart = tl.load(ss_ptr + bidx).to(tl.int64)
+        tstart = tl.load(csq_ptr + bidx).to(tl.int64)
+        boff = tid - tstart + bstart
+
+        blk_off = boff // page_size
+        slot = boff % page_size
+        blk_off = tl.where(blk_off < 0, 0, blk_off)
+        blk_off = tl.where(
+            blk_off > max_block_num - 1, max_block_num - 1, blk_off)
+
+        blk_id = tl.load(
+            bt_ptr + bidx * bt_stride0 + blk_off).to(tl.int64)
+        pslot = blk_id * page_size + slot
+
+        _pd = tl.cast(packed_dim, tl.int64)
+        _nh = tl.cast(num_heads, tl.int64)
+        _ps = tl.cast(page_size, tl.int64)
+        cbase = blk_id * (_ps * _nh * _pd) + slot * (_nh * _pd) + hid * _pd
+
+        offsets = tl.arange(0, HEAD_DIM)
+        bi = (offsets >> 1).to(tl.int64)
+        hi = offsets & 1
+
+        kb = tl.load(kc_ptr + cbase + bi)
+        kn = tl.where(
+            hi != 0, (kb >> 4) & 0x0F, kb & 0x0F).to(tl.int32)
+        kf = tl.load(lut_ptr + kn)
+
+        blki = (offsets // QUANT_BLK).to(tl.int64)
+        blki = tl.where(
+            blki > N_SC_BLKS - 1, N_SC_BLKS - 1, blki)
+        srow = hid * N_SC_BLKS + blki
+        _sr0 = tl.cast(sc_stride0, tl.int64)
+        ksc = tl.load(k_sc_ptr + srow * _sr0 + pslot)
+        kf = kf * ksc
+
+        obase = (tid * tl.cast(out_stride_tok, tl.int64)
+                 + hid * tl.cast(out_stride_head, tl.int64))
+        oi64 = offsets.to(tl.int64)
+        if IS_BF16:
+            tl.store(k_out_ptr + obase + oi64, kf.to(tl.bfloat16))
+        else:
+            tl.store(k_out_ptr + obase + oi64, kf.to(tl.float16))
+
+        vb = tl.load(vc_ptr + cbase + bi)
+        vn = tl.where(
+            hi != 0, (vb >> 4) & 0x0F, vb & 0x0F).to(tl.int32)
+        vf = tl.load(lut_ptr + vn)
+        vsc = tl.load(v_sc_ptr + srow * _sr0 + pslot)
+        vf = vf * vsc
+        if IS_BF16:
+            tl.store(v_out_ptr + obase + oi64, vf.to(tl.bfloat16))
+        else:
+            tl.store(v_out_ptr + obase + oi64, vf.to(tl.float16))
+
+    # ----------------------------------------------------------------
+    # Fused Triton kernel: FP4 cache WRITE (quantize + pack + store)
+    # Replaces the C++ reshape_and_cache_flash_with_pertoken_quant
+    # and the Python _fp4_default_python_write fallback with a single
+    # JIT-compiled kernel launch.
+    # Grid: (num_tokens, num_kv_heads)
+    # ----------------------------------------------------------------
+    _FP4_TRITON_WRITE_OK: bool | None = False
+
+    @triton.jit
+    def _fp4_quantize_e2m1(x):
+        """FP4 E2M1 quantization: float → 4-bit code [0..15].
+
+        Branchless sum-of-comparisons matching the Python reference.
+        """
+        sign = tl.where(x < 0.0, 8, 0)
+        ax = tl.abs(x)
+        code = (
+            (ax >= 0.25).to(tl.int32)
+            + (ax >= 0.75).to(tl.int32)
+            + (ax >= 1.25).to(tl.int32)
+            + (ax >= 1.75).to(tl.int32)
+            + (ax >= 2.5).to(tl.int32)
+            + (ax >= 3.5).to(tl.int32)
+            + (ax >= 5.0).to(tl.int32)
+        )
+        return code | sign
+
+    @triton.jit
+    def _fp4_fused_cache_write_kernel(
+        k_src_ptr, v_src_ptr,
+        kc_ptr, vc_ptr,
+        k_sc_ptr, v_sc_ptr,
+        slot_map_ptr,
+        num_heads,
+        page_size,
+        src_stride_tok,
+        src_stride_head,
+        total_slots,
+        PACKED_DIM: tl.constexpr,
+        HALF_BLK: tl.constexpr,
+        NUM_BLOCKS: tl.constexpr,
+    ):
+        tid = tl.program_id(0).to(tl.int64)
+        hid = tl.program_id(1).to(tl.int64)
+
+        phys_slot = tl.load(slot_map_ptr + tid)
+        if phys_slot < 0:
+            return
+        phys_slot = phys_slot.to(tl.int64)
+        blk_id = phys_slot // page_size
+        slot_off = phys_slot % page_size
+
+        src_base = tid * src_stride_tok + hid * src_stride_head
+        byte_off = tl.arange(0, PACKED_DIM).to(tl.int64)
+        even_idx = byte_off * 2
+        odd_idx = byte_off * 2 + 1
+
+        _pd = tl.cast(PACKED_DIM, tl.int64)
+        _nh = tl.cast(num_heads, tl.int64)
+        _ps = tl.cast(page_size, tl.int64)
+        cache_base = (blk_id * (_ps * _nh * _pd)
+                      + slot_off * (_nh * _pd) + hid * _pd)
+        _ts = tl.cast(total_slots, tl.int64)
+
+        k_even = tl.load(k_src_ptr + src_base + even_idx).to(tl.float32)
+        k_odd = tl.load(k_src_ptr + src_base + odd_idx).to(tl.float32)
+
+        k_norm_e = tl.zeros([PACKED_DIM], dtype=tl.float32)
+        k_norm_o = tl.zeros([PACKED_DIM], dtype=tl.float32)
+
+        for b in range(NUM_BLOCKS):
+            bmask = ((byte_off >= b * HALF_BLK)
+                     & (byte_off < (b + 1) * HALF_BLK))
+            e_abs = tl.where(bmask, tl.abs(k_even), 0.0)
+            o_abs = tl.where(bmask, tl.abs(k_odd), 0.0)
+            absmax = tl.maximum(tl.max(e_abs), tl.max(o_abs))
+            scale = tl.maximum(absmax / 6.0, 1e-3)
+            inv = 1.0 / scale
+            k_norm_e = tl.where(bmask, k_even * inv, k_norm_e)
+            k_norm_o = tl.where(bmask, k_odd * inv, k_norm_o)
+            tl.store(
+                k_sc_ptr + (hid * NUM_BLOCKS + b) * _ts + phys_slot,
+                scale)
+
+        kc_e = _fp4_quantize_e2m1(k_norm_e)
+        kc_o = _fp4_quantize_e2m1(k_norm_o)
+        k_packed = (kc_e & 0xF) | ((kc_o & 0xF) << 4)
+        tl.store(kc_ptr + cache_base + byte_off,
+                 k_packed.to(tl.uint8))
+
+        v_even = tl.load(v_src_ptr + src_base + even_idx).to(tl.float32)
+        v_odd = tl.load(v_src_ptr + src_base + odd_idx).to(tl.float32)
+
+        v_norm_e = tl.zeros([PACKED_DIM], dtype=tl.float32)
+        v_norm_o = tl.zeros([PACKED_DIM], dtype=tl.float32)
+
+        for b in range(NUM_BLOCKS):
+            bmask = ((byte_off >= b * HALF_BLK)
+                     & (byte_off < (b + 1) * HALF_BLK))
+            e_abs = tl.where(bmask, tl.abs(v_even), 0.0)
+            o_abs = tl.where(bmask, tl.abs(v_odd), 0.0)
+            absmax = tl.maximum(tl.max(e_abs), tl.max(o_abs))
+            scale = tl.maximum(absmax / 6.0, 1e-3)
+            inv = 1.0 / scale
+            v_norm_e = tl.where(bmask, v_even * inv, v_norm_e)
+            v_norm_o = tl.where(bmask, v_odd * inv, v_norm_o)
+            tl.store(
+                v_sc_ptr + (hid * NUM_BLOCKS + b) * _ts + phys_slot,
+                scale)
+
+        vc_e = _fp4_quantize_e2m1(v_norm_e)
+        vc_o = _fp4_quantize_e2m1(v_norm_o)
+        v_packed = (vc_e & 0xF) | ((vc_o & 0xF) << 4)
+        tl.store(vc_ptr + cache_base + byte_off,
+                 v_packed.to(tl.uint8))
+
+    def _fp4_triton_cache_write(
+        cache_key, cache_value,
+        key_cache, value_cache,
+        k_scales_2d, v_scales_2d,
+        slot_mapping,
+        head_size,
+    ):
+        kc_u8 = key_cache.view(torch.uint8)
+        vc_u8 = value_cache.view(torch.uint8)
+        num_tokens = cache_key.shape[0]
+        num_heads = cache_key.shape[1]
+        packed_dim = head_size // 2
+        page_size = kc_u8.shape[1]
+        num_blocks = max(1, head_size // FP4_QUANT_BLOCK_SIZE)
+        total_slots = k_scales_2d.shape[1]
+        _nw = max(1, min(4, packed_dim // 32))
+
+        grid = (num_tokens, num_heads)
+        _fp4_fused_cache_write_kernel[grid](
+            cache_key, cache_value,
+            kc_u8, vc_u8,
+            k_scales_2d, v_scales_2d,
+            slot_mapping,
+            num_heads, page_size,
+            cache_key.stride(0), cache_key.stride(1),
+            total_slots,
+            PACKED_DIM=packed_dim,
+            HALF_BLK=FP4_QUANT_BLOCK_SIZE // 2,
+            NUM_BLOCKS=num_blocks,
+            num_warps=_nw,
+        )
+
+    def _fp4_triton_gather_dequant(
+        key_cache, value_cache,
+        key, value,
+        block_tables, cu_seqlens_kv, token_to_batch, seq_starts,
+        total_tokens,
+        k_scales_2d, v_scales_2d,
+        page_size, num_heads, packed_dim, head_dim,
+        max_block_num, num_scale_blocks,
+    ):
+        kc_u8 = key_cache.view(torch.uint8)
+        vc_u8 = value_cache.view(torch.uint8)
+        e2m1_lut = _get_fp4_e2m1_lut(key.device)
+        is_bf16 = key.dtype == torch.bfloat16
+        _nw = max(1, min(4, head_dim // 64))
+
+        grid = (total_tokens, num_heads)
+        _fp4_fused_gather_dequant_kernel[grid](
+            kc_u8, vc_u8,
+            k_scales_2d, v_scales_2d,
+            token_to_batch, seq_starts, cu_seqlens_kv,
+            block_tables,
+            e2m1_lut,
+            key, value,
+            num_heads, packed_dim, page_size, max_block_num,
+            block_tables.stride(0),
+            k_scales_2d.stride(0),
+            key.stride(0), key.stride(1),
+            HEAD_DIM=head_dim,
+            QUANT_BLK=FP4_QUANT_BLOCK_SIZE,
+            N_SC_BLKS=num_scale_blocks,
+            IS_BF16=is_bf16,
+            num_warps=_nw,
+        )
+
     def _fp4_gather_and_dequant_cache(
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
@@ -1600,38 +1934,160 @@ if current_platform.is_rocm():
         head_dim = packed_dim * 2
         max_block_num = block_tables.size(1)
 
+        _is_per_ch_k = (
+            k_dequant_scales_2d is not None
+            and k_dequant_scales_2d.shape[0] == num_heads
+            and k_dequant_scales_2d.ndim >= 2
+            and k_dequant_scales_2d.shape[1] == head_dim
+        )
+
+        # ---- OPT-1: C++ fused gather+dequant+scale kernel ----
+        # Replaces ~26 Python kernel launches with 1 HIP kernel.
+        _use_cpp = (
+            k_dequant_scales_2d is not None
+            and v_dequant_scales_2d is not None
+            and k_dequant_scales_2d.dtype in (
+                torch.float32, torch.float16, torch.uint8)
+            and not _FP4_HADAMARD
+            and not _FP4_AMXFP4
+            and not _is_per_ch_k
+            and total_tokens > 0
+        )
+        global _FP4_CPP_GATHER_OK
+        if _use_cpp and _FP4_CPP_GATHER_OK is not False:
+            _kc_u8 = key_cache.view(torch.uint8)
+            _vc_u8 = value_cache.view(torch.uint8)
+            _t2b = token_to_batch[:total_tokens]
+            if _FP4_CPP_GATHER_OK is True:
+                torch.ops._C_cache_ops \
+                    .fp4_gather_dequant_kv(
+                        _kc_u8, _vc_u8,
+                        key[:total_tokens],
+                        value[:total_tokens],
+                        _t2b,
+                        seq_starts,
+                        cu_seqlens_kv,
+                        block_tables,
+                        k_dequant_scales_2d,
+                        v_dequant_scales_2d,
+                        total_tokens,
+                    )
+                return
+            try:
+                torch.ops._C_cache_ops \
+                    .fp4_gather_dequant_kv(
+                        _kc_u8, _vc_u8,
+                        key[:total_tokens],
+                        value[:total_tokens],
+                        _t2b,
+                        seq_starts,
+                        cu_seqlens_kv,
+                        block_tables,
+                        k_dequant_scales_2d,
+                        v_dequant_scales_2d,
+                        total_tokens,
+                    )
+                torch.cuda.current_stream().synchronize()
+                _samp = key[:min(total_tokens, 10)].abs() \
+                    .sum()
+                if _samp.item() > 0:
+                    _FP4_CPP_GATHER_OK = True
+                    logger.info(
+                        "FP4 C++ fused gather kernel "
+                        "validated OK.")
+                    return
+                logger.warning(
+                    "FP4 C++ gather produced all zeros."
+                    " Falling back to Python.")
+                _FP4_CPP_GATHER_OK = False
+            except Exception as _e:
+                logger.warning(
+                    "FP4 C++ gather kernel failed: "
+                    "%s. Using Python fallback.", _e)
+                _FP4_CPP_GATHER_OK = False
+
+        # ---- Triton path (disabled on AMD/ROCm) ----
+        global _FP4_TRITON_OK
+        if (
+            _FP4_TRITON_OK is not False
+            and _use_cpp
+            and (head_dim & (head_dim - 1)) == 0
+            and key.stride(-1) == 1
+        ):
+            _nkb = k_dequant_scales_2d.shape[0] // num_heads
+            _nvb = v_dequant_scales_2d.shape[0] // num_heads
+            if _nkb == _nvb and _nkb > 0:
+                _triton_args = (
+                    key_cache, value_cache,
+                    key, value,
+                    block_tables, cu_seqlens_kv,
+                    token_to_batch, seq_starts,
+                    total_tokens,
+                    k_dequant_scales_2d,
+                    v_dequant_scales_2d,
+                    page_size, num_heads,
+                    packed_dim, head_dim,
+                    max_block_num, _nkb,
+                )
+                if _FP4_TRITON_OK is True:
+                    _fp4_triton_gather_dequant(
+                        *_triton_args)
+                    return
+                try:
+                    _fp4_triton_gather_dequant(
+                        *_triton_args)
+                    _FP4_TRITON_OK = True
+                    return
+                except Exception as _e:
+                    logger.warning(
+                        "FP4 fused Triton kernel "
+                        "failed (%s). Falling back "
+                        "to Python path.", _e)
+                    _FP4_TRITON_OK = False
+
+        # ---- Python fallback path ----
+        _use_native_dtype = (
+            k_dequant_scales_2d is not None
+            and v_dequant_scales_2d is not None
+            and k_dequant_scales_2d.dtype != torch.uint8
+            and not _FP4_HADAMARD
+        )
+
         kc_u8 = key_cache.view(torch.uint8)
         vc_u8 = value_cache.view(torch.uint8)
 
-        token_ids = torch.arange(
-            total_tokens, device=key_cache.device, dtype=torch.int64
-        )
         batch_idx = token_to_batch[:total_tokens].long()
         batch_start = seq_starts[batch_idx]
         token_start = cu_seqlens_kv[batch_idx]
-        batch_offset = (token_ids - token_start + batch_start).long()
+        _ar = _get_cached_arange(
+            total_tokens, key_cache.device)
+        batch_offset = _ar - token_start + batch_start
         block_offset = batch_offset // page_size
         slot_id = batch_offset % page_size
-        block_offset = block_offset.clamp(0, max_block_num - 1)
-        block_id = block_tables[batch_idx, block_offset].long()
+        block_offset = block_offset.clamp(
+            0, max_block_num - 1)
+        block_id = block_tables[
+            batch_idx, block_offset].long()
 
         packed_k = kc_u8[block_id, slot_id]
         packed_v = vc_u8[block_id, slot_id]
 
-        lut = _get_fp4_e2m1_lut(key.device)
+        if _use_native_dtype:
+            byte_lut = _get_fp4_byte_lut_typed(
+                key.device, key.dtype)
+        else:
+            byte_lut = _get_fp4_byte_lut(key.device)
 
-        k_lo = (packed_k & 0x0F).long()
-        k_hi = ((packed_k >> 4) & 0x0F).long()
-        k_vals = torch.stack([lut[k_lo], lut[k_hi]], dim=-1)
-        k_out = k_vals.reshape(total_tokens, num_heads, head_dim)
-
-        v_lo = (packed_v & 0x0F).long()
-        v_hi = ((packed_v >> 4) & 0x0F).long()
-        v_vals = torch.stack([lut[v_lo], lut[v_hi]], dim=-1)
-        v_out = v_vals.reshape(total_tokens, num_heads, head_dim)
+        _kv_idx = torch.cat(
+            [packed_k, packed_v], dim=0).long()
+        _kv_deq = byte_lut[_kv_idx]
+        k_out = _kv_deq[:total_tokens].reshape(
+            total_tokens, num_heads, head_dim)
+        v_out = _kv_deq[total_tokens:].reshape(
+            total_tokens, num_heads, head_dim)
 
         if k_dequant_scales_2d is not None and v_dequant_scales_2d is not None:
-            physical_slot_idx = block_id * page_size + slot_id
+            physical_slot_idx = slot_id.add(block_id, alpha=page_size)
 
             is_per_channel_k = (
                 k_dequant_scales_2d.shape[0] == num_heads
@@ -1642,8 +2098,19 @@ if current_platform.is_rocm():
             is_nvfp4_mode = _FP4_NVFP4
             is_amxfp4_mode = _FP4_AMXFP4
 
+            if is_amxfp4_mode and (is_uint8_k or is_uint8_v):
+                _arange_tok = torch.arange(
+                    total_tokens, device=key.device,
+                    dtype=torch.int64).unsqueeze(1)
+                _arange_hd = torch.arange(
+                    num_heads, device=key.device,
+                    dtype=torch.int64).unsqueeze(0)
+
             if is_per_channel_k:
-                k_out = k_out * k_dequant_scales_2d.unsqueeze(0)
+                _kds = k_dequant_scales_2d
+                if _use_native_dtype:
+                    _kds = _kds.to(key.dtype)
+                k_out = k_out * _kds.unsqueeze(0)
             elif is_uint8_k:
                 if is_amxfp4_mode:
                     num_k_blocks = k_dequant_scales_2d.shape[0] // \
@@ -1686,12 +2153,8 @@ if current_platform.is_rocm():
                         packed_byte_idx = global_pos // 2
                         nib_in_byte = global_pos % 2
                         raw_byte = packed_k[
-                            torch.arange(total_tokens,
-                                         device=key.device
-                                         ).unsqueeze(1),
-                            torch.arange(num_heads,
-                                         device=key.device
-                                         ).unsqueeze(0),
+                            _arange_tok,
+                            _arange_hd,
                             packed_byte_idx]
                         nibble = torch.where(
                             nib_in_byte == 0,
@@ -1701,23 +2164,19 @@ if current_platform.is_rocm():
                         scale_at_bm = k_sc_float[:, :, blk]
                         corrected = bm_correct * scale_at_bm
                         k_out[
-                            torch.arange(total_tokens,
-                                         device=key.device
-                                         ).unsqueeze(1),
-                            torch.arange(num_heads,
-                                         device=key.device
-                                         ).unsqueeze(0),
+                            _arange_tok,
+                            _arange_hd,
                             global_pos] = corrected
                 else:
                     num_k_blocks = k_dequant_scales_2d.shape[0] // \
                         num_heads
                     k_sc_raw = k_dequant_scales_2d[
                         :, physical_slot_idx]
-                    if is_nvfp4_mode:
-                        k_sc_float = _fp8_e4m3_to_float(k_sc_raw)
-                    else:
+                    if _FP4_MXFP4 and not is_nvfp4_mode:
                         k_sc_float = torch.pow(
                             2.0, k_sc_raw.float() - 127.0)
+                    else:
+                        k_sc_float = _fp8_e4m3_to_float(k_sc_raw)
                     k_sc_float = k_sc_float.reshape(
                         num_heads, num_k_blocks, total_tokens
                     ).permute(2, 0, 1)
@@ -1728,20 +2187,46 @@ if current_platform.is_rocm():
                         * k_sc_float.unsqueeze(-1)
                     ).reshape(total_tokens, num_heads, head_dim)
             else:
-                num_k_blocks = k_dequant_scales_2d.shape[0] // num_heads
+                num_k_blocks = (
+                    k_dequant_scales_2d.shape[0]
+                    // num_heads)
                 if num_k_blocks > 1:
-                    k_sc = k_dequant_scales_2d[:, physical_slot_idx]
+                    k_sc = k_dequant_scales_2d[
+                        :, physical_slot_idx]
+                    if _use_native_dtype:
+                        k_sc = k_sc.to(key.dtype)
                     k_sc = k_sc.reshape(
-                        num_heads, num_k_blocks, total_tokens
+                        num_heads, num_k_blocks,
+                        total_tokens
                     ).permute(2, 0, 1)
-                    k_out = (
-                        k_out.view(
+                    if _use_native_dtype:
+                        key[:total_tokens] = \
+                            k_out.reshape(
+                                total_tokens,
+                                num_heads, head_dim)
+                        key[:total_tokens].view(
                             total_tokens, num_heads,
-                            num_k_blocks, FP4_QUANT_BLOCK_SIZE)
-                        * k_sc.unsqueeze(-1)
-                    ).reshape(total_tokens, num_heads, head_dim)
+                            num_k_blocks,
+                            FP4_QUANT_BLOCK_SIZE
+                        ).mul_(k_sc.unsqueeze(-1))
+                        k_out = key[:total_tokens]
+                    else:
+                        k_out = (
+                            k_out.view(
+                                total_tokens,
+                                num_heads,
+                                num_k_blocks,
+                                FP4_QUANT_BLOCK_SIZE)
+                            * k_sc.unsqueeze(-1)
+                        ).reshape(
+                            total_tokens,
+                            num_heads, head_dim)
                 else:
-                    k_scales = k_dequant_scales_2d[:, physical_slot_idx]
+                    k_scales = k_dequant_scales_2d[
+                        :, physical_slot_idx]
+                    if _use_native_dtype:
+                        k_scales = k_scales.to(
+                            key.dtype)
                     k_scales = k_scales.T.unsqueeze(-1)
                     k_out = k_out * k_scales
 
@@ -1785,12 +2270,8 @@ if current_platform.is_rocm():
                         packed_byte_idx = global_pos // 2
                         nib_in_byte = global_pos % 2
                         raw_byte = packed_v[
-                            torch.arange(total_tokens,
-                                         device=key.device
-                                         ).unsqueeze(1),
-                            torch.arange(num_heads,
-                                         device=key.device
-                                         ).unsqueeze(0),
+                            _arange_tok,
+                            _arange_hd,
                             packed_byte_idx]
                         nibble = torch.where(
                             nib_in_byte == 0,
@@ -1800,23 +2281,19 @@ if current_platform.is_rocm():
                         scale_at_bm = v_sc_float[:, :, blk]
                         corrected = bm_correct * scale_at_bm
                         v_out[
-                            torch.arange(total_tokens,
-                                         device=key.device
-                                         ).unsqueeze(1),
-                            torch.arange(num_heads,
-                                         device=key.device
-                                         ).unsqueeze(0),
+                            _arange_tok,
+                            _arange_hd,
                             global_pos] = corrected
                 else:
                     num_v_blocks = v_dequant_scales_2d.shape[0] // \
                         num_heads
                     v_sc_raw = v_dequant_scales_2d[
                         :, physical_slot_idx]
-                    if is_nvfp4_mode:
-                        v_sc_float = _fp8_e4m3_to_float(v_sc_raw)
-                    else:
+                    if _FP4_MXFP4 and not is_nvfp4_mode:
                         v_sc_float = torch.pow(
                             2.0, v_sc_raw.float() - 127.0)
+                    else:
+                        v_sc_float = _fp8_e4m3_to_float(v_sc_raw)
                     v_sc_float = v_sc_float.reshape(
                         num_heads, num_v_blocks, total_tokens
                     ).permute(2, 0, 1)
@@ -1827,20 +2304,46 @@ if current_platform.is_rocm():
                         * v_sc_float.unsqueeze(-1)
                     ).reshape(total_tokens, num_heads, head_dim)
             else:
-                num_v_blocks = v_dequant_scales_2d.shape[0] // num_heads
+                num_v_blocks = (
+                    v_dequant_scales_2d.shape[0]
+                    // num_heads)
                 if num_v_blocks > 1:
-                    v_sc = v_dequant_scales_2d[:, physical_slot_idx]
+                    v_sc = v_dequant_scales_2d[
+                        :, physical_slot_idx]
+                    if _use_native_dtype:
+                        v_sc = v_sc.to(key.dtype)
                     v_sc = v_sc.reshape(
-                        num_heads, num_v_blocks, total_tokens
+                        num_heads, num_v_blocks,
+                        total_tokens
                     ).permute(2, 0, 1)
-                    v_out = (
-                        v_out.view(
+                    if _use_native_dtype:
+                        value[:total_tokens] = \
+                            v_out.reshape(
+                                total_tokens,
+                                num_heads, head_dim)
+                        value[:total_tokens].view(
                             total_tokens, num_heads,
-                            num_v_blocks, FP4_QUANT_BLOCK_SIZE)
-                        * v_sc.unsqueeze(-1)
-                    ).reshape(total_tokens, num_heads, head_dim)
+                            num_v_blocks,
+                            FP4_QUANT_BLOCK_SIZE
+                        ).mul_(v_sc.unsqueeze(-1))
+                        v_out = value[:total_tokens]
+                    else:
+                        v_out = (
+                            v_out.view(
+                                total_tokens,
+                                num_heads,
+                                num_v_blocks,
+                                FP4_QUANT_BLOCK_SIZE)
+                            * v_sc.unsqueeze(-1)
+                        ).reshape(
+                            total_tokens,
+                            num_heads, head_dim)
                 else:
-                    v_scales = v_dequant_scales_2d[:, physical_slot_idx]
+                    v_scales = v_dequant_scales_2d[
+                        :, physical_slot_idx]
+                    if _use_native_dtype:
+                        v_scales = v_scales.to(
+                            key.dtype)
                     v_scales = v_scales.T.unsqueeze(-1)
                     v_out = v_out * v_scales
 
@@ -1850,8 +2353,31 @@ if current_platform.is_rocm():
             k_out = _hadamard_inv_rotate(k_out, signs)
             v_out = _hadamard_inv_rotate(v_out, signs)
 
-        key[:total_tokens] = k_out.to(key.dtype)
-        value[:total_tokens] = v_out.to(value.dtype)
+        _k_already_written = (
+            _use_native_dtype
+            and k_dequant_scales_2d is not None
+            and not _FP4_HADAMARD
+            and k_out.data_ptr()
+            == key[:total_tokens].data_ptr()
+        )
+        _v_already_written = (
+            _use_native_dtype
+            and v_dequant_scales_2d is not None
+            and not _FP4_HADAMARD
+            and v_out.data_ptr()
+            == value[:total_tokens].data_ptr()
+        )
+        if not _k_already_written:
+            if _use_native_dtype:
+                key[:total_tokens] = k_out
+            else:
+                key[:total_tokens] = k_out.to(key.dtype)
+        if not _v_already_written:
+            if _use_native_dtype:
+                value[:total_tokens] = v_out
+            else:
+                value[:total_tokens] = v_out.to(
+                    value.dtype)
 
     def cp_mha_gather_cache(
         key_cache: torch.Tensor,
@@ -2500,10 +3026,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
         )
         if (_FP4_PER_CHANNEL_K
                 and fp4_k_channel_scales is not None):
-            key_fetched[:swa_total_tokens] = (
-                key_fetched[:swa_total_tokens].float()
-                * fp4_k_channel_scales.unsqueeze(0)
-            ).to(key_fetched.dtype)
+            key_fetched[:swa_total_tokens].mul_(
+                fp4_k_channel_scales.to(
+                    key_fetched.dtype).unsqueeze(0))
 
         aiter.flash_attn_varlen_func(
             q=query,
@@ -2589,31 +3114,50 @@ class AiterFlashAttentionImpl(AttentionImpl):
         key_fetched, value_fetched = workspace[0], workspace[1]
         chunked_output = None
         chunked_lse = None
+        if num_chunks > 1:
+            _mbuf_out = torch.empty_like(out)
+            _mbuf_lse = torch.empty_like(lse)
+        _is_fp4_gather = (
+            key_cache.shape[3] != key_fetched.shape[2])
         for chunk_idx in range(num_chunks):
-            cp_mha_gather_cache(
-                key_cache=key_cache,
-                value_cache=value_cache,
-                key=key_fetched,
-                value=value_fetched,
-                block_tables=block_table,
-                k_scales=k_scale,
-                v_scales=v_scale,
-                cu_seqlens_kv=cu_seqlens_kv[chunk_idx],
-                token_to_batch=token_to_batch[chunk_idx],
-                seq_starts=chunk_starts[chunk_idx],
-                dequant=False,
-                kv_cache_layout="SHUFFLE" if USING_SHUFFLE_LAYOUT else "NHD",
-                total_tokens=total_token_per_batch[chunk_idx],
-                k_dequant_scales_2d=fp4_k_scales_2d,
-                v_dequant_scales_2d=fp4_v_scales_2d,
-            )
+            if _is_fp4_gather:
+                _fp4_gather_and_dequant_cache(
+                    key_cache, value_cache,
+                    key_fetched, value_fetched,
+                    block_table,
+                    cu_seqlens_kv[chunk_idx],
+                    token_to_batch[chunk_idx],
+                    chunk_starts[chunk_idx],
+                    total_token_per_batch[chunk_idx],
+                    fp4_k_scales_2d,
+                    fp4_v_scales_2d,
+                )
+            else:
+                cp_mha_gather_cache(
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    key=key_fetched,
+                    value=value_fetched,
+                    block_tables=block_table,
+                    k_scales=k_scale,
+                    v_scales=v_scale,
+                    cu_seqlens_kv=cu_seqlens_kv[chunk_idx],
+                    token_to_batch=token_to_batch[chunk_idx],
+                    seq_starts=chunk_starts[chunk_idx],
+                    dequant=False,
+                    kv_cache_layout="SHUFFLE"
+                    if USING_SHUFFLE_LAYOUT else "NHD",
+                    total_tokens=total_token_per_batch[
+                        chunk_idx],
+                    k_dequant_scales_2d=fp4_k_scales_2d,
+                    v_dequant_scales_2d=fp4_v_scales_2d,
+                )
             if (_FP4_PER_CHANNEL_K
                     and fp4_k_channel_scales is not None):
                 _ttb = total_token_per_batch[chunk_idx]
-                key_fetched[:_ttb] = (
-                    key_fetched[:_ttb].float()
-                    * fp4_k_channel_scales.unsqueeze(0)
-                ).to(key_fetched.dtype)
+                key_fetched[:_ttb].mul_(
+                    fp4_k_channel_scales.to(
+                        key_fetched.dtype).unsqueeze(0))
 
             suf_out, suf_lse = aiter.flash_attn_varlen_func(
                 q=query,
@@ -2635,18 +3179,18 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 chunked_output = suf_out
                 chunked_lse = suf_lse
             else:
-                tmp_output = torch.empty_like(out)
-                tmp_lse = torch.empty_like(lse)
                 merge_attn_states(
-                    output=tmp_output,
-                    output_lse=tmp_lse,
+                    output=_mbuf_out,
+                    output_lse=_mbuf_lse,
                     prefix_output=chunked_output,
                     prefix_lse=chunked_lse,
                     suffix_output=suf_out,
                     suffix_lse=suf_lse,
                 )
-                chunked_output = tmp_output
-                chunked_lse = tmp_lse
+                chunked_output, _mbuf_out = \
+                    _mbuf_out, chunked_output
+                chunked_lse, _mbuf_lse = \
+                    _mbuf_lse, chunked_lse
 
         merge_attn_states(
             output=output,
@@ -3052,17 +3596,10 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             cache_key.shape[0], head_size,
                         )
                     _default_cpp_ok = getattr(
-                        layer, "_fp4_default_cpp_validated",
+                        layer,
+                        "_fp4_default_cpp_validated",
                         None)
-                    if _default_cpp_ok is False:
-                        _fp4_default_python_write(
-                            cache_key, cache_value,
-                            key_cache, value_cache,
-                            k_2d, v_2d,
-                            attn_metadata.slot_mapping,
-                            head_size,
-                        )
-                    elif _is_capturing or _default_cpp_ok:
+                    if _default_cpp_ok is True or _is_capturing:
                         torch.ops._C_cache_ops \
                             .reshape_and_cache_flash_with_pertoken_quant(
                                 cache_key,
@@ -3074,68 +3611,106 @@ class AiterFlashAttentionImpl(AttentionImpl):
                                 attn_metadata.slot_mapping,
                                 self.kv_cache_dtype,
                             )
+                    elif _default_cpp_ok is False:
+                        _fp4_default_python_write(
+                            cache_key, cache_value,
+                            key_cache, value_cache,
+                            k_2d, v_2d,
+                            attn_metadata.slot_mapping,
+                            head_size,
+                        )
                     else:
-                        try:
-                            torch.ops._C_cache_ops \
-                                .reshape_and_cache_flash_with_pertoken_quant(
-                                    cache_key,
-                                    cache_value,
-                                    key_cache,
-                                    value_cache,
-                                    k_2d,
-                                    v_2d,
-                                    attn_metadata.slot_mapping,
-                                    self.kv_cache_dtype,
-                                )
-                            valid_slots = \
-                                attn_metadata.slot_mapping[
-                                    attn_metadata.slot_mapping
-                                    >= 0]
-                            if valid_slots.numel() > 0:
-                                torch.cuda.current_stream(
-                                    key_cache.device
-                                ).synchronize()
-                                sample = k_2d[
-                                    0, valid_slots[:min(
-                                        32,
-                                        valid_slots.numel()
-                                    )]]
-                                if (sample.abs().sum()
-                                        .item() == 0):
-                                    logger.warning(
-                                        "Default FP4 C++ write "
-                                        "kernel produced "
-                                        "all-zero scales "
-                                        "(%d samples). "
-                                        "Falling back to "
-                                        "Python permanently.",
-                                        sample.numel())
-                                    layer._fp4_default_cpp_validated\
-                                        = False
-                                else:
-                                    layer._fp4_default_cpp_validated\
-                                        = True
-                            else:
-                                layer._fp4_default_cpp_validated\
-                                    = True
-                        except Exception as e:
-                            logger.warning(
-                                "Default FP4 C++ write "
-                                "kernel failed: %s. "
-                                "Using Python fallback "
-                                "permanently.", e)
-                            layer._fp4_default_cpp_validated\
-                                = False
-                        if _default_cpp_ok is None \
-                                and layer._fp4_default_cpp_validated\
-                                is False:
-                            _fp4_default_python_write(
+                        global _FP4_TRITON_WRITE_OK
+                        _write_done = False
+                        _pd = head_size // 2
+                        if (_FP4_TRITON_WRITE_OK is not False
+                                and (_pd & (_pd - 1)) == 0):
+                            _w_args = (
                                 cache_key, cache_value,
                                 key_cache, value_cache,
                                 k_2d, v_2d,
                                 attn_metadata.slot_mapping,
                                 head_size,
                             )
+                            if _FP4_TRITON_WRITE_OK is True:
+                                _fp4_triton_cache_write(
+                                    *_w_args)
+                                _write_done = True
+                            else:
+                                try:
+                                    _fp4_triton_cache_write(
+                                        *_w_args)
+                                    _FP4_TRITON_WRITE_OK = True
+                                    _write_done = True
+                                except Exception as _we:
+                                    logger.warning(
+                                        "FP4 Triton write "
+                                        "kernel failed (%s)."
+                                        " Using C++/Python.",
+                                        _we)
+                                    _FP4_TRITON_WRITE_OK = \
+                                        False
+                        if not _write_done:
+                            try:
+                                torch.ops._C_cache_ops \
+                                    .reshape_and_cache_flash_with_pertoken_quant(
+                                        cache_key,
+                                        cache_value,
+                                        key_cache,
+                                        value_cache,
+                                        k_2d,
+                                        v_2d,
+                                        attn_metadata
+                                        .slot_mapping,
+                                        self.kv_cache_dtype,
+                                    )
+                                torch.cuda \
+                                    .current_stream() \
+                                    .synchronize()
+                                _nsamp = min(
+                                    cache_key.shape[0], 10)
+                                _k_sample = k_2d[
+                                    :, :_nsamp].sum()
+                                if _k_sample.item() == 0:
+                                    logger.warning(
+                                        "Default FP4 C++ "
+                                        "write produced "
+                                        "all-zero scales."
+                                        " Using Python "
+                                        "fallback.")
+                                    layer \
+                                        ._fp4_default_cpp_validated \
+                                        = False
+                                    _fp4_default_python_write(
+                                        cache_key,
+                                        cache_value,
+                                        key_cache,
+                                        value_cache,
+                                        k_2d, v_2d,
+                                        attn_metadata
+                                        .slot_mapping,
+                                        head_size,
+                                    )
+                                else:
+                                    layer \
+                                        ._fp4_default_cpp_validated\
+                                        = True
+                            except Exception as e:
+                                logger.warning(
+                                    "Default FP4 C++ write "
+                                    "kernel failed: %s. "
+                                    "Using Python fallback "
+                                    "permanently.", e)
+                                layer \
+                                    ._fp4_default_cpp_validated\
+                                    = False
+                                _fp4_default_python_write(
+                                    cache_key, cache_value,
+                                    key_cache, value_cache,
+                                    k_2d, v_2d,
+                                    attn_metadata.slot_mapping,
+                                    head_size,
+                                )
             elif USING_SHUFFLE_LAYOUT:
                 num_blocks, block_size, num_kv_heads, head_size = \
                     key_cache.shape
@@ -3501,14 +4076,17 @@ class AiterFlashAttentionImpl(AttentionImpl):
                             decode_q, signs).to(query.dtype)
 
                     if fp4_per_channel_k_active:
-                        k_ch = layer._fp4_k_channel_scales
-                        gqa_ratio = self.num_heads // self.num_kv_heads
-                        k_ch_q = k_ch.repeat_interleave(
-                            gqa_ratio, dim=0
-                        )
+                        if not hasattr(layer, '_fp4_k_ch_q_decode'):
+                            k_ch = layer._fp4_k_channel_scales
+                            gqa_ratio = (
+                                self.num_heads // self.num_kv_heads)
+                            layer._fp4_k_ch_q_decode = (
+                                k_ch.repeat_interleave(
+                                    gqa_ratio, dim=0
+                                ).to(decode_q.dtype))
                         decode_q = (
-                            decode_q.float() * k_ch_q.unsqueeze(0)
-                        ).to(decode_q.dtype)
+                            decode_q
+                            * layer._fp4_k_ch_q_decode.unsqueeze(0))
 
                     # --- Universal FP4 decode-time diagnostic + self-healing ---
                     # One-time per-layer check on first decode: log mode,

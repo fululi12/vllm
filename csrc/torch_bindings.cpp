@@ -53,6 +53,19 @@ void reshape_and_cache_flash_fp4_amxfp4(
               "Please rebuild vLLM with the updated cache_kernels.cu.");
 }
 
+void fp4_gather_dequant_kv(
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    torch::Tensor& key_out,
+    torch::Tensor& value_out,
+    torch::Tensor& token_to_batch,
+    torch::Tensor& seq_starts,
+    torch::Tensor& cu_seqlens_kv,
+    torch::Tensor& block_tables,
+    torch::Tensor& k_scales,
+    torch::Tensor& v_scales,
+    int64_t total_tokens);
+
 #ifdef __GNUC__
 __attribute__((weak))
 #endif
@@ -813,6 +826,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "    str kv_cache_dtype) -> ()");
   cache_ops.impl("reshape_and_cache_flash_with_pertoken_quant", torch::kCUDA,
                  &reshape_and_cache_flash_with_pertoken_quant);
+
+  // Fused FP4 gather + dequant + block-32 scale for the prefill read path.
+  cache_ops.def(
+      "fp4_gather_dequant_kv("
+      "    Tensor key_cache, Tensor value_cache,"
+      "    Tensor! key_out, Tensor! value_out,"
+      "    Tensor token_to_batch, Tensor seq_starts,"
+      "    Tensor cu_seqlens_kv, Tensor block_tables,"
+      "    Tensor k_scales, Tensor v_scales,"
+      "    int total_tokens) -> ()");
+  cache_ops.impl("fp4_gather_dequant_kv", torch::kCUDA,
+                 &fp4_gather_dequant_kv);
 
   cache_ops.def(
       "reshape_and_cache_flash_fp4_per_channel_k_per_token_v("
