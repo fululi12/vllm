@@ -205,11 +205,13 @@ class QuarkOCP_MX(QuarkScheme):
         self.rocm_use_aiter_fp4_asm_gemm = is_rocm_aiter_fp4_asm_gemm_enabled()
 
         if not self.emulate and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None):
-            # Currently need these kernels if not emulating
-            raise NotImplementedError(
-                f"{self.__class__.__name__} requires AITER to be installed "
-                "for non-emulation mode! Please refer to "
-                "https://github.com/ROCm/aiter for installation details."
+            self.emulate = True
+            logger.warning_once(
+                "%s: AITER native gemm kernels (dynamic_mxfp4_quant / "
+                "gemm_afp4wfp4) not available. Falling back to emulation "
+                "mode. For best performance, install AITER: "
+                "https://github.com/ROCm/aiter",
+                self.__class__.__name__,
             )
 
         if not current_platform.supports_mx():
@@ -341,3 +343,4 @@ class QuarkOCP_MX(QuarkScheme):
                 self.rocm_use_aiter_fp4_asm_gemm,
                 self.out_dtype,
             )
+
