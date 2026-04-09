@@ -1007,13 +1007,14 @@ __inline__ __device__ uint8_t float_to_fp8_e4m3(float x) {
 
 __inline__ __device__ float fp8_e4m3_to_float(uint8_t x) {
   if (x == 0) return 0.0f;
-  int exp_bits = (x >> 3) & 0xF;
-  int mantissa = x & 0x7;
+  const unsigned int exp_bits = (x >> 3) & 0xFu;
+  const unsigned int mantissa = x & 0x7u;
   if (exp_bits == 0) {
-    return exp2f(-7.0f) * (static_cast<float>(mantissa) / 8.0f);
+    return static_cast<float>(mantissa) * (1.0f / 1024.0f);
   }
-  return exp2f(static_cast<float>(exp_bits - 8))
-         * (1.0f + static_cast<float>(mantissa) / 8.0f);
+  union { unsigned int u; float f; } conv;
+  conv.u = ((exp_bits + 119u) << 23) | (mantissa << 20);
+  return conv.f;
 }
 
 // ---------------------------------------------------------------------------
