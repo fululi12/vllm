@@ -1447,19 +1447,18 @@ __global__ void reshape_and_cache_flash_fp4_pertoken_quant_kernel(
     v_block_scale_inv[b] = 1.0f / fmaxf(rounded, 1e-30f);
   }
 
-  // --- Store scales ----------------------------------------------------------
-  const int64_t k_blk_stride =
-      (num_k_quant_blocks > 1) ? (k_scale_stride_h / num_k_quant_blocks) : 0;
-  const int64_t v_blk_stride =
-      (num_v_quant_blocks > 1) ? (v_scale_stride_h / num_v_quant_blocks) : 0;
+  // --- Store scales (interleaved: [head, token, block]) ----------------------
+  // All block scales for a token are contiguous in memory, enabling the PA
+  // kernel to load them with a single vectorized read instead of 4 separate
+  // strided reads that each fetch a different L2 cache line.
   if (lane_id < num_k_quant_blocks) {
     k_dequant_scales[head_idx * k_scale_stride_h
-                     + lane_id * k_blk_stride + slot_idx] =
+                     + slot_idx * num_k_quant_blocks + lane_id] =
         float_to_fp8_e4m3(k_block_scale[lane_id]);
   }
   if (lane_id < num_v_quant_blocks) {
     v_dequant_scales[head_idx * v_scale_stride_h
-                     + lane_id * v_blk_stride + slot_idx] =
+                     + slot_idx * num_v_quant_blocks + lane_id] =
         float_to_fp8_e4m3(v_block_scale[lane_id]);
   }
 
